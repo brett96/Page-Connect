@@ -265,7 +265,7 @@ async function finalizeRunFailure(message) {
  * process class as the final URL (avoids extension-page → site process swap at `tabs.update`).
  * @param {{ cancel: boolean }} run
  * @param {string} targetUrl
- * @returns {Promise<{ tabId: number, windowId: number | null } | null>} ids or null
+ * @returns {Promise<{ tabId: number, windowId: number | null, windowState: string | null } | null>} ids or null
  */
 async function createWarmupTab(run, targetUrl) {
   if (run.cancel) return null;
@@ -282,8 +282,17 @@ async function createWarmupTab(run, targetUrl) {
     } catch {
       /* not supported on some channels/builds; ignore */
     }
-    await mergeRunState({ warmupTabId: tab.id, warmupWindowId: tab.windowId ?? null });
-    return { tabId: tab.id, windowId: tab.windowId ?? null };
+    let windowState = null;
+    if (tab.windowId != null) {
+      try {
+        const win = await chrome.windows.get(tab.windowId);
+        windowState = win?.state ?? null;
+      } catch {
+        /* ignore */
+      }
+    }
+    await mergeRunState({ warmupTabId: tab.id, warmupWindowId: tab.windowId ?? null, warmupWindowState: windowState });
+    return { tabId: tab.id, windowId: tab.windowId ?? null, windowState };
   } catch (e) {
     console.warn("Warmup tab create failed:", e);
     return null;
@@ -296,22 +305,25 @@ async function createWarmupTab(run, targetUrl) {
  * @param {string} targetUrl
  * @param {number | null | undefined} warmupTabId
  * @param {number | null | undefined} warmupWindowId
+ * @param {string | null | undefined} warmupWindowState
  */
-function navigateToTarget(targetUrl, warmupTabId, warmupWindowId) {
+function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState) {
   if (typeof warmupTabId === "number") {
     chrome.tabs.update(warmupTabId, { url: targetUrl, active: true, muted: false }).catch(() => {});
     if (typeof warmupWindowId === "number") {
-      // Avoid extra IPC reads at launch; just request focus + restore.
-      chrome.windows.update(warmupWindowId, { focused: true, drawAttention: true, state: "normal" }).catch(() => {});
+      // Only restore/focus if we *know* the window was minimized.
+      // Avoid focusing/adjusting otherwise; on Windows this can exit fullscreen or resize unexpectedly.
+      if (warmupWindowState === "minimized") {
+        chrome.windows.update(warmupWindowId, { focused: true, drawAttention: true, state: "normal" }).catch(() => {});
+      }
     }
     return;
   }
   chrome.tabs
     .create({ url: targetUrl, active: true })
     .then((newTab) => {
-      if (newTab?.windowId != null) {
-        chrome.windows.update(newTab.windowId, { focused: true, drawAttention: true, state: "normal" }).catch(() => {});
-      }
+      // Intentionally avoid `chrome.windows.update` here: if the destination window is fullscreen,
+      // focusing can cause a resize/exit-fullscreen on some platforms. Activating the tab is enough.
     })
     .catch(() => {});
 }
@@ -330,6 +342,7 @@ async function executeFromT60(run, state) {
   const warm = await createWarmupTab(run, targetUrl);
   const warmupTabId = warm?.tabId ?? null;
   const warmupWindowId = warm?.windowId ?? null;
+  const warmupWindowState = warm?.windowState ?? null;
   if (warmupTabId == null) {
     notifyStatus("Warmup tab unavailable — will open the target in a new tab at launch.");
   }
@@ -371,7 +384,7 @@ async function executeFromT60(run, state) {
   const now = Date.now();
   if (adjustedLaunchTime <= now) {
     notifyStatus("Adjusted launch time already passed — navigating now.");
-    navigateToTarget(targetUrl, warmupTabId, warmupWindowId);
+    navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState);
     await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
     return;
   }
@@ -432,7 +445,7 @@ async function executeFromT60(run, state) {
     if (when <= Date.now()) {
       await waitUntilEpoch(adjustedLaunchTime, run);
       if (run.cancel) return;
-      navigateToTarget(targetUrl, warmupTabId, warmupWindowId);
+      navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState);
       await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
       return;
     }
@@ -446,7 +459,7 @@ async function executeFromT60(run, state) {
   keepSocketHot = false;
   if (run.cancel) return;
 
-  navigateToTarget(targetUrl, warmupTabId, warmupWindowId);
+  navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState);
   await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
 }
 
@@ -525,7 +538,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
           notifyStatus("Cancelled.");
           return;
         }
-        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId);
+        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId, st.warmupWindowState);
         await finalizeRunSuccess("Opened at adjusted time.");
       }
     } catch (e) {
@@ -610,7 +623,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       try {
         await chrome.storage.local.set({
           [ACTIVE_KEY]: true,
-          [RUN_KEY]: { targetUrl, targetEpochMs, warmupTabId: null, warmupWindowId: null, adjustedLaunchTime: null },
+          [RUN_KEY]: {
+            targetUrl,
+            targetEpochMs,
+            warmupTabId: null,
+            warmupWindowId: null,
+            warmupWindowState: null,
+            adjustedLaunchTime: null,
+          },
         });
 
         if (oneMinuteBefore <= now) {
