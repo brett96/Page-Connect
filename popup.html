@@ -32,10 +32,10 @@
         <div class="field" style="margin-bottom: 0">
           <label for="timeZone">Timezone</label>
           <select id="timeZone">
-            <option value="America/Los_Angeles" selected>PST / PDT (Pacific)</option>
-            <option value="America/Denver">MST / MDT (Mountain)</option>
-            <option value="America/Chicago">CST / CDT (Central)</option>
-            <option value="America/New_York">EST / EDT (Eastern)</option>
+            <option value="America/Los_Angeles" selected>Pacific (PST/PDT)</option>
+            <option value="America/Denver">Mountain (MST/MDT)</option>
+            <option value="America/Chicago">Central (CST/CDT)</option>
+            <option value="America/New_York">Eastern (EST/EDT)</option>
             <option value="UTC">UTC</option>
           </select>
         </div>
@@ -45,12 +45,14 @@
       </p>
 
       <div class="actions">
-        <button type="button" id="btnStart" class="btn-primary">Start</button>
-        <button type="button" id="btnCancel" class="btn-secondary" disabled>Cancel</button>
+        <button type="button" id="btnToggle" class="btn-primary">Start</button>
       </div>
 
       <div class="field" style="margin-top: 14px; margin-bottom: 0">
-        <label for="status">Status</label>
+        <label for="status" class="status-label">
+          <span>Status</span>
+          <span id="statusBadge" class="badge badge-idle" aria-hidden="true">Idle</span>
+        </label>
         <div id="status" class="status" role="status" aria-live="polite">
           <strong>Idle.</strong>
           Configure URL and time, then press Start.

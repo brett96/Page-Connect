@@ -26,11 +26,16 @@ const elDateTime = document.getElementById("targetDateTime");
 /** @type {HTMLSelectElement} */
 const elTimeZone = document.getElementById("timeZone");
 /** @type {HTMLButtonElement} */
-const elStart = document.getElementById("btnStart");
-/** @type {HTMLButtonElement} */
-const elCancel = document.getElementById("btnCancel");
+const elToggle = document.getElementById("btnToggle");
 /** @type {HTMLDivElement} */
 const elStatus = document.getElementById("status");
+/** @type {HTMLSpanElement} */
+const elBadge = document.getElementById("statusBadge");
+
+/** @type {"idle" | "running" | "error"} */
+let uiState = "idle";
+/** True if the UI believes a run is active (guards against late STATUS messages after Stop). */
+let shouldBeRunning = false;
 
 /**
  * Allows normal http(s) page URLs only (no javascript:, file:, etc.).
@@ -125,12 +130,34 @@ function setIdle(sub) {
   elStatus.innerHTML = `<strong>Idle.</strong>\n${sub}`;
 }
 
+/**
+ * @param {"idle" | "running" | "error"} state
+ * @param {string} label
+ */
+function setBadge(state, label) {
+  uiState = state;
+  elBadge.textContent = label;
+  elBadge.classList.remove("badge-idle", "badge-running", "badge-error");
+  elBadge.classList.add(state === "running" ? "badge-running" : state === "error" ? "badge-error" : "badge-idle");
+}
+
 function setRunningUi(running) {
-  elStart.disabled = running;
-  elCancel.disabled = !running;
   elUrl.disabled = running;
   elDateTime.disabled = running;
   elTimeZone.disabled = running;
+
+  shouldBeRunning = running;
+  if (running) {
+    elToggle.textContent = "Stop";
+    elToggle.classList.remove("btn-primary");
+    elToggle.classList.add("btn-danger");
+    setBadge("running", "Running");
+  } else {
+    elToggle.textContent = "Start";
+    elToggle.classList.remove("btn-danger");
+    elToggle.classList.add("btn-primary");
+    if (uiState !== "error") setBadge("idle", "Idle");
+  }
 }
 
 async function loadSaved() {
@@ -156,32 +183,37 @@ async function loadSaved() {
   }
 }
 
-elStart.addEventListener("click", async () => {
+async function startFlow() {
   const targetUrl = elUrl.value.trim();
   const targetDateTime = elDateTime.value;
   const timeZone = elTimeZone.value;
 
   if (!targetUrl) {
+    setBadge("error", "Error");
     setStatus("Please enter a Target URL.");
     return;
   }
   if (!isValidHttpPageUrl(targetUrl)) {
+    setBadge("error", "Error");
     setStatus("Invalid URL. Use an http(s) link, e.g. https://example.com/…");
     return;
   }
   if (!targetDateTime) {
+    setBadge("error", "Error");
     setStatus("Please choose a target date and time.");
     return;
   }
 
   const targetEpochMs = zonedLocalToUtcMs(targetDateTime, timeZone);
   if (targetEpochMs == null || !Number.isFinite(targetEpochMs)) {
+    setBadge("error", "Error");
     setStatus("Could not parse the target time for the selected timezone.");
     return;
   }
 
   const now = Date.now();
   if (targetEpochMs <= now) {
+    setBadge("error", "Error");
     setStatus("Target time must be in the future.");
     return;
   }
@@ -189,6 +221,7 @@ elStart.addEventListener("click", async () => {
   // Need at least ~1 minute + ping window headroom (Phase 2 starts at T-60s, pings take ~30s).
   const minLead = 65_000;
   if (targetEpochMs - now < minLead) {
+    setBadge("error", "Error");
     setStatus(`Target must be at least ${Math.ceil(minLead / 1000)} seconds from now (pre-wait + latency pings).`);
     return;
   }
@@ -199,6 +232,7 @@ elStart.addEventListener("click", async () => {
     await chrome.storage.local.set({ [STORAGE_KEY]: config, [ACTIVE_KEY]: true });
   } catch (e) {
     console.error("storage set", e);
+    setBadge("error", "Error");
     setStatus("Could not save settings to storage.");
     return;
   }
@@ -210,30 +244,53 @@ elStart.addEventListener("click", async () => {
     await chrome.runtime.sendMessage({ type: MSG.START, payload: config });
   } catch (e) {
     console.error("sendMessage", e);
+    setBadge("error", "Error");
     setStatus("Could not reach the background worker. Try reloading the extension.");
     setRunningUi(false);
     await chrome.storage.local.set({ [ACTIVE_KEY]: false });
   }
-});
+}
 
-elCancel.addEventListener("click", async () => {
+async function stopFlow() {
+  // Immediately flip local state so any late STATUS messages don't revert the badge.
+  shouldBeRunning = false;
   try {
     await chrome.runtime.sendMessage({ type: MSG.CANCEL });
   } catch (e) {
     console.error("cancel message", e);
   }
   setRunningUi(false);
+  setBadge("idle", "Idle");
   setIdle("Cancelled.");
+}
+
+elToggle.addEventListener("click", async () => {
+  if (uiState === "running") {
+    await stopFlow();
+  } else {
+    // Clear previous error badge when user retries.
+    setBadge("idle", "Idle");
+    await startFlow();
+  }
 });
 
 chrome.runtime.onMessage.addListener((msg) => {
   if (!msg || typeof msg !== "object") return;
   if (msg.type === MSG.STATUS && typeof msg.text === "string") {
+    if (shouldBeRunning) setBadge("running", "Running");
     setStatus(msg.text);
   }
   if (msg.type === MSG.DONE) {
+    shouldBeRunning = false;
     setRunningUi(false);
-    if (typeof msg.text === "string") setStatus(msg.text);
+    if (msg.success === false) {
+      setBadge("error", "Error");
+      if (typeof msg.text === "string") setStatus(msg.text);
+    } else {
+      setBadge("idle", "Idle");
+      if (typeof msg.text === "string") setStatus(msg.text);
+      else setIdle("Ready.");
+    }
   }
 });
 
@@ -253,12 +310,14 @@ async function syncRunningStateWithBackground() {
     setIdle("Configure URL and time, then press Start.");
   } catch {
     await chrome.storage.local.set({ [ACTIVE_KEY]: false });
+    setBadge("error", "Error");
     setRunningUi(false);
-    setIdle("Configure URL and time, then press Start.");
+    setStatus("Background worker unavailable (reload the extension).");
   }
 }
 
 (async () => {
   await loadSaved();
+  setBadge("idle", "Idle");
   await syncRunningStateWithBackground();
 })();
