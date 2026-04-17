@@ -10,10 +10,12 @@ It’s built around the realities of MV3 service workers (they can sleep) and th
   - A **Target URL** (any `http://` or `https://` URL)
   - A **Target date/time** (with **seconds** support) + a **timezone** (defaults to Pacific)
 - **Page Connect**:
-  - Waits until about **1 minute before** the target time
-  - Measures latency to the target origin via a small burst of fetch requests
-  - Computes an **Adjusted Launch Time** = `TargetTime − avgLatency`
-  - Navigates a pre-warmed tab to the target URL at the adjusted time
+  - Wakes up early (alarms) and then works toward **T−60s**
+  - Opens a **warmup tab** on the same origin (lightweight 404 HTML route)
+  - Measures network latency with a primer ping + 4 timed pings
+  - Calculates an **Adjusted Launch Time** that targets **server-arrival** time (RTT/2) and accounts for local IPC delay
+  - Keeps sockets warm via an **in-tab heartbeat** (same network partition as the final navigation)
+  - At launch, dispatches tab navigation + window focus **without blocking awaits**
 
 ## How it works (high-level)
 
@@ -21,8 +23,8 @@ It’s built around the realities of MV3 service workers (they can sleep) and th
 Manifest V3 background code runs in a **service worker**, which Chrome may suspend while waiting.
 
 To survive long waits, Page Connect uses the **Alarms API**:
-- For long pre-waits, it schedules an alarm at **T−70 seconds** (`pageConnectAlarmPreLatency`) and persists the job into `chrome.storage.local`.
-- For long final waits, it schedules an alarm **15 seconds** before the adjusted launch time (`pageConnectAlarmPreLaunch`) to give a cold-booted service worker enough runway to wake, read state, and start the final high-precision wait.
+- For long pre-waits, it schedules a wake-up at **T−3 minutes** (`pageConnectAlarmPreLatency`) so OS-level timer throttling won’t cause you to miss the T−60 latency window.
+- For long final waits, it schedules a wake-up **15 seconds** before the adjusted launch time (`pageConnectAlarmPreLaunch`) so a cold-booted service worker has runway to wake, read state, and start the final high-precision wait.
 
 ### Latency measurement (“pings”)
 Latency checks are done with `fetch()`:
@@ -32,19 +34,36 @@ Latency checks are done with `fetch()`:
 - Then **4 measured pings**, 10 seconds apart, are averaged.
 - Any failed ping contributes **0ms** for that sample (so the flow still completes).
 
+**Important math note:** the measured value is **RTT** (round-trip). To target “request arrives at server at target time”, Page Connect approximates **one-way latency** as \(RTT/2\).
+
+### Local IPC overhead measurement
+Right after latency measurement, Page Connect measures local extension→renderer IPC cost by timing an empty:
+- `chrome.scripting.executeScript({ func: () => {} })`
+
+It uses half of that round-trip as the one-way IPC estimate and subtracts it in the launch math.
+
 ### Warm tab navigation (reduces launch jitter)
 Opening a brand new tab at the exact millisecond can add 50–200ms of overhead.
 
 Instead, around **T−60s**, Page Connect opens a background tab to:
-- `{origin}/robots.txt`
+- `{origin}/_page_connect_warmup_<timestamp>`
 
 This keeps the tab on the **same origin** as the final destination, helping Chrome allocate the “right kind” of renderer process and warm connection pools before the final navigation.
 
 At launch time, it does:
-- `chrome.tabs.update(warmupTabId, { url: targetUrl, active: true })`
-- Then focuses the window via `chrome.windows.update(windowId, { focused: true })`
+- `chrome.tabs.update(warmupTabId, { url: targetUrl, active: true, muted: false })`
+- In parallel, `chrome.windows.update(windowId, { focused: true, drawAttention: true, state: "normal" })`
 
 If the warm tab was closed or fails, it falls back to `chrome.tabs.create`.
+
+### In-tab socket heartbeat (network partition correctness)
+Modern Chromium uses network partitioning; sockets opened by the service worker may not be reusable by a tab’s main frame.
+
+To keep the **tab’s** connection pool hot, Page Connect injects a small heartbeat into the warmup tab:
+- Every ~8 seconds it does `fetch(origin, { method: "HEAD", cache: "no-store", priority: "high" })`
+- Stops ~2 seconds before launch
+
+If injection is blocked, it falls back to a service-worker heartbeat.
 
 ### Orphaned UI protection
 If Chrome crashes or the extension reloads, a stored “active” flag can become stale.
@@ -64,6 +83,8 @@ The popup sends a **PING** message on load. If the background is not actually ru
 - **`tabs`**: create/update a tab for warmup + launch navigation
 - **`alarms`**: schedule long waits reliably in MV3 (wake the service worker)
 - **`windows`**: bring the target Chrome window to the foreground at launch
+- **`power`**: request “keep awake” during the critical countdown windows to avoid OS sleep/throttling
+- **`scripting`**: measure IPC overhead and inject the in-tab heartbeat
 - **Host permissions: `<all_urls>`**: allow `fetch()` latency checks to any target origin
 
 ## Install in Chrome (Unpacked / Developer Mode)
@@ -90,6 +111,8 @@ The popup sends a **PING** message on load. If the background is not actually ru
 
 - **Absolute millisecond precision is not guaranteed** in a browser:
   - OS scheduling, CPU load, power-saving, network variability, and Chrome throttling can still introduce jitter.
+- **Local system clock skew matters**:
+  - The schedule is based on `Date.now()`. Before important drops, manually sync your OS clock (Windows “Sync now”).
 - **Some sites may block or rate-limit HEAD/GET**; Page Connect will fall back and/or treat failures as 0ms samples.
 - **If you close the warmup tab**, Page Connect will fall back to opening the target in a new tab at launch.
 

@@ -3,7 +3,7 @@
  *
  * Long waits use `chrome.alarms` so Chrome can suspend this worker without losing the schedule.
  * Latency pings use `HEAD` when possible (falls back to `GET`).
- * Launch uses a same-origin warmup tab (`{origin}/robots.txt`) + `chrome.tabs.update` so the renderer
+ * Launch uses a same-origin warmup tab (lightweight 404 HTML route) + `chrome.tabs.update` so the renderer
  * matches the target site (avoids extension-page to web process swap at navigation).
  *
  * Phases (conceptual):
@@ -44,6 +44,11 @@ const PRE_LAUNCH_LEAD_MS = 15_000;
 const HEARTBEAT_MS = 8_000;
 /** Stop heartbeats shortly before launch so they don’t contend with navigation. */
 const HEARTBEAT_CUTOFF_MS = 2_000;
+/**
+ * Chrome extension APIs cross process boundaries (IPC) before the renderer navigates.
+ * This adds a small, consistent delay on most machines; subtracting it helps hit the server on-time.
+ */
+const IPC_FALLBACK_MS = 12;
 
 /** @type {{ cancel: boolean } | null} */
 let session = null;
@@ -148,9 +153,8 @@ async function waitUntilEpoch(targetEpochMs, run) {
       const msUntilTarget = targetEpochMs - Date.now();
       if (msUntilTarget <= 0) return;
       const targetPerf = performance.now() + msUntilTarget;
-      while (performance.now() < targetPerf) {
-        if (run.cancel) return;
-      }
+      // Final spin: keep it purely primitive (no object/property reads) to avoid micro-stalls.
+      while (performance.now() < targetPerf) {}
       return;
     }
   }
@@ -169,6 +173,7 @@ async function pingOnce(url) {
       cache: "no-store",
       credentials: "omit",
       redirect: "follow",
+      priority: "high",
     });
     const t1 = performance.now();
     if (!res.ok) {
@@ -256,17 +261,19 @@ async function finalizeRunFailure(message) {
 }
 
 /**
- * Opens a background tab on the target origin (`/robots.txt`) so Chrome uses the same renderer
+ * Opens a background tab on the target origin (lightweight 404 HTML route) so Chrome uses the same renderer
  * process class as the final URL (avoids extension-page → site process swap at `tabs.update`).
  * @param {{ cancel: boolean }} run
  * @param {string} targetUrl
- * @returns {Promise<number | null>} tab id or null
+ * @returns {Promise<{ tabId: number, windowId: number | null } | null>} ids or null
  */
 async function createWarmupTab(run, targetUrl) {
   if (run.cancel) return null;
   try {
     const targetOrigin = new URL(targetUrl).origin;
-    const warmupUrl = `${targetOrigin}/robots.txt`;
+    // Use a unique fake path so most servers return a lightweight 404 HTML page.
+    // This lets us inject an in-tab heartbeat that warms the *tab's* network partition.
+    const warmupUrl = `${targetOrigin}/_page_connect_warmup_${Date.now()}`;
     const tab = await chrome.tabs.create({ url: warmupUrl, active: false, muted: true });
     if (tab.id == null) return null;
     // Resist Chrome Memory Saver tab discarding under heavy RAM pressure.
@@ -275,8 +282,8 @@ async function createWarmupTab(run, targetUrl) {
     } catch {
       /* not supported on some channels/builds; ignore */
     }
-    await mergeRunState({ warmupTabId: tab.id });
-    return tab.id;
+    await mergeRunState({ warmupTabId: tab.id, warmupWindowId: tab.windowId ?? null });
+    return { tabId: tab.id, windowId: tab.windowId ?? null };
   } catch (e) {
     console.warn("Warmup tab create failed:", e);
     return null;
@@ -285,25 +292,28 @@ async function createWarmupTab(run, targetUrl) {
 
 /**
  * Navigate the warmup tab to the target, or open a new tab if warmup is missing.
+ * Fire-and-forget: dispatch IPC commands without awaiting responses (reduces T-0 overhead).
  * @param {string} targetUrl
  * @param {number | null | undefined} warmupTabId
+ * @param {number | null | undefined} warmupWindowId
  */
-async function navigateToTarget(targetUrl, warmupTabId) {
+function navigateToTarget(targetUrl, warmupTabId, warmupWindowId) {
   if (typeof warmupTabId === "number") {
-    try {
-      const tab = await chrome.tabs.update(warmupTabId, { url: targetUrl, active: true });
-      if (tab?.windowId != null) {
-        await chrome.windows.update(tab.windowId, { focused: true });
-      }
-      return;
-    } catch (e) {
-      console.warn("tabs.update failed, falling back to tabs.create:", e);
+    chrome.tabs.update(warmupTabId, { url: targetUrl, active: true, muted: false }).catch(() => {});
+    if (typeof warmupWindowId === "number") {
+      // Avoid extra IPC reads at launch; just request focus + restore.
+      chrome.windows.update(warmupWindowId, { focused: true, drawAttention: true, state: "normal" }).catch(() => {});
     }
+    return;
   }
-  const newTab = await chrome.tabs.create({ url: targetUrl, active: true });
-  if (newTab.windowId != null) {
-    await chrome.windows.update(newTab.windowId, { focused: true });
-  }
+  chrome.tabs
+    .create({ url: targetUrl, active: true })
+    .then((newTab) => {
+      if (newTab?.windowId != null) {
+        chrome.windows.update(newTab.windowId, { focused: true, drawAttention: true, state: "normal" }).catch(() => {});
+      }
+    })
+    .catch(() => {});
 }
 
 /**
@@ -314,9 +324,12 @@ async function navigateToTarget(targetUrl, warmupTabId) {
 async function executeFromT60(run, state) {
   lockPowerAwake();
   const { targetUrl, targetEpochMs } = state;
+  const targetOrigin = new URL(targetUrl).origin;
 
-  notifyStatus("Opening warmup tab on target origin (robots.txt)…");
-  const warmupTabId = await createWarmupTab(run, targetUrl);
+  notifyStatus("Opening warmup tab on target origin (warm 404)…");
+  const warm = await createWarmupTab(run, targetUrl);
+  const warmupTabId = warm?.tabId ?? null;
+  const warmupWindowId = warm?.windowId ?? null;
   if (warmupTabId == null) {
     notifyStatus("Warmup tab unavailable — will open the target in a new tab at launch.");
   }
@@ -327,37 +340,91 @@ async function executeFromT60(run, state) {
   const avgLatency = await runLatencySuite(targetUrl, run);
   if (run.cancel) return;
 
-  const adjustedLaunchTime = Math.round(targetEpochMs - avgLatency);
+  // `avgLatency` is measured as RTT (round-trip). To target server-arrival time, approximate one-way transit as RTT/2.
+  const oneWayLatency = avgLatency / 2;
+
+  // Dynamically measure IPC overhead to the specific warm tab renderer.
+  // `executeScript` crosses the same extension→browser→renderer IPC path; divide RTT by 2 for one-way.
+  notifyStatus("Measuring local CPU IPC overhead…");
+  let dynamicIpcMs = IPC_FALLBACK_MS;
+  if (typeof warmupTabId === "number") {
+    try {
+      const t0 = performance.now();
+      await chrome.scripting.executeScript({
+        target: { tabId: warmupTabId },
+        func: () => {},
+      });
+      dynamicIpcMs = Math.max(0, (performance.now() - t0) / 2);
+    } catch (e) {
+      console.warn("IPC measure failed, using fallback:", e);
+      dynamicIpcMs = IPC_FALLBACK_MS;
+    }
+  }
+
+  const adjustedLaunchTime = Math.round(targetEpochMs - oneWayLatency - dynamicIpcMs);
   await mergeRunState({ adjustedLaunchTime });
 
   notifyStatus(
-    `Average latency: ${avgLatency.toFixed(1)} ms. Adjusted launch (UTC): ${new Date(adjustedLaunchTime).toISOString()}. Final countdown…`,
+    `Avg RTT: ${avgLatency.toFixed(1)} ms (≈ one-way ${(oneWayLatency).toFixed(1)} ms) + IPC ${dynamicIpcMs.toFixed(1)} ms. Adjusted launch (UTC): ${new Date(adjustedLaunchTime).toISOString()}. Final countdown…`,
   );
 
   const now = Date.now();
   if (adjustedLaunchTime <= now) {
     notifyStatus("Adjusted launch time already passed — navigating now.");
-    await navigateToTarget(targetUrl, warmupTabId ?? (await readRunState())?.warmupTabId);
+    navigateToTarget(targetUrl, warmupTabId, warmupWindowId);
     await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
     return;
   }
 
   const msUntilLaunch = adjustedLaunchTime - now;
 
-  // Socket heartbeat: keep the CDN/TCP/TLS path warm between the last ping and launch.
-  // Note: this only helps while this worker stays alive for the countdown.
+  // Socket heartbeat: prefer warming sockets from inside the warm tab's network partition.
+  // If injection fails (site restrictions / tab not ready), fall back to the service-worker heartbeat.
   let keepSocketHot = true;
-  const heartbeatStopAt = adjustedLaunchTime - HEARTBEAT_CUTOFF_MS;
-  void (async () => {
-    while (keepSocketHot && !run.cancel) {
-      const t = Date.now();
-      if (t >= heartbeatStopAt) break;
-      await delay(Math.min(HEARTBEAT_MS, Math.max(0, heartbeatStopAt - t)), run);
-      if (!keepSocketHot || run.cancel) break;
-      if (Date.now() >= heartbeatStopAt) break;
-      fetch(targetUrl, { method: "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
+  let usingInjectedHeartbeat = false;
+  if (typeof warmupTabId === "number") {
+    try {
+      const cutoffMs = Math.max(0, msUntilLaunch - HEARTBEAT_CUTOFF_MS);
+      await chrome.scripting.executeScript({
+        target: { tabId: warmupTabId },
+        func: (origin, cutoffMs, intervalMs) => {
+          // Runs inside the warmup tab (main-frame partition).
+          const stopAt = Date.now() + cutoffMs;
+          // Clear any previous run if present.
+          try {
+            if (globalThis.__pageConnectHeartbeatTimer) clearInterval(globalThis.__pageConnectHeartbeatTimer);
+          } catch {}
+          globalThis.__pageConnectHeartbeatTimer = setInterval(() => {
+            if (Date.now() > stopAt) {
+              clearInterval(globalThis.__pageConnectHeartbeatTimer);
+              globalThis.__pageConnectHeartbeatTimer = null;
+              return;
+            }
+            fetch(origin, { method: "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
+          }, intervalMs);
+        },
+        args: [targetOrigin, cutoffMs, HEARTBEAT_MS],
+      });
+      usingInjectedHeartbeat = true;
+      notifyStatus("Socket heartbeat transferred to renderer process partition.");
+    } catch (e) {
+      console.warn("Tab injection failed, falling back to SW heartbeat:", e);
     }
-  })();
+  }
+
+  if (!usingInjectedHeartbeat) {
+    const heartbeatStopAt = adjustedLaunchTime - HEARTBEAT_CUTOFF_MS;
+    void (async () => {
+      while (keepSocketHot && !run.cancel) {
+        const t = Date.now();
+        if (t >= heartbeatStopAt) break;
+        await delay(Math.min(HEARTBEAT_MS, Math.max(0, heartbeatStopAt - t)), run);
+        if (!keepSocketHot || run.cancel) break;
+        if (Date.now() >= heartbeatStopAt) break;
+        fetch(targetOrigin, { method: "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
+      }
+    })();
+  }
 
   if (msUntilLaunch > LONG_WAIT_MS) {
     keepSocketHot = false;
@@ -365,8 +432,7 @@ async function executeFromT60(run, state) {
     if (when <= Date.now()) {
       await waitUntilEpoch(adjustedLaunchTime, run);
       if (run.cancel) return;
-      const rs = await readRunState();
-      await navigateToTarget(targetUrl, rs?.warmupTabId);
+      navigateToTarget(targetUrl, warmupTabId, warmupWindowId);
       await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
       return;
     }
@@ -380,8 +446,7 @@ async function executeFromT60(run, state) {
   keepSocketHot = false;
   if (run.cancel) return;
 
-  const rs = await readRunState();
-  await navigateToTarget(targetUrl, rs?.warmupTabId);
+  navigateToTarget(targetUrl, warmupTabId, warmupWindowId);
   await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
 }
 
@@ -460,8 +525,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
           notifyStatus("Cancelled.");
           return;
         }
-        const latest = await readRunState();
-        await navigateToTarget(st.targetUrl, latest?.warmupTabId);
+        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId);
         await finalizeRunSuccess("Opened at adjusted time.");
       }
     } catch (e) {
@@ -499,6 +563,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const st = await readRunState();
       if (st?.warmupTabId != null) {
         try {
+          // Best-effort: stop any injected heartbeat before closing the warmup tab.
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId: st.warmupTabId },
+              func: () => {
+                try {
+                  if (globalThis.__pageConnectHeartbeatTimer) clearInterval(globalThis.__pageConnectHeartbeatTimer);
+                  globalThis.__pageConnectHeartbeatTimer = null;
+                } catch {}
+              },
+            });
+          } catch {
+            /* ignore */
+          }
           await chrome.tabs.remove(st.warmupTabId);
         } catch {
           /* ignore */
@@ -532,7 +610,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       try {
         await chrome.storage.local.set({
           [ACTIVE_KEY]: true,
-          [RUN_KEY]: { targetUrl, targetEpochMs, warmupTabId: null, adjustedLaunchTime: null },
+          [RUN_KEY]: { targetUrl, targetEpochMs, warmupTabId: null, warmupWindowId: null, adjustedLaunchTime: null },
         });
 
         if (oneMinuteBefore <= now) {

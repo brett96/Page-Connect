@@ -3,7 +3,7 @@
   "name": "Page Connect",
   "version": "1.0.0",
   "description": "Opens a URL at a precise time, adjusted for measured network latency.",
-  "permissions": ["storage", "tabs", "alarms", "windows", "power"],
+  "permissions": ["storage", "tabs", "alarms", "windows", "power", "scripting"],
   "host_permissions": ["<all_urls>"],
   "background": {
     "service_worker": "background.js",
