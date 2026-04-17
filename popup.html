@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Page Connect</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <h1>Page Connect</h1>
+        <p>Open any page at an exact time, adjusted for measured network latency.</p>
+      </header>
+
+      <div class="field">
+        <label for="targetUrl">Target URL</label>
+        <input
+          id="targetUrl"
+          type="url"
+          placeholder="https://example.com/path"
+          autocomplete="off"
+          spellcheck="false"
+        />
+      </div>
+
+      <div class="row">
+        <div class="field" style="margin-bottom: 0">
+          <label for="targetDateTime">Target date &amp; time</label>
+          <input id="targetDateTime" type="datetime-local" step="1" />
+        </div>
+        <div class="field" style="margin-bottom: 0">
+          <label for="timeZone">Timezone</label>
+          <select id="timeZone">
+            <option value="America/Los_Angeles" selected>PST / PDT (Pacific)</option>
+            <option value="America/Denver">MST / MDT (Mountain)</option>
+            <option value="America/Chicago">CST / CDT (Central)</option>
+            <option value="America/New_York">EST / EDT (Eastern)</option>
+            <option value="UTC">UTC</option>
+          </select>
+        </div>
+      </div>
+      <p class="hint">
+        The datetime is interpreted as wall-clock time in the selected timezone (default Pacific).
+      </p>
+
+      <div class="actions">
+        <button type="button" id="btnStart" class="btn-primary">Start</button>
+        <button type="button" id="btnCancel" class="btn-secondary" disabled>Cancel</button>
+      </div>
+
+      <div class="field" style="margin-top: 14px; margin-bottom: 0">
+        <label for="status">Status</label>
+        <div id="status" class="status" role="status" aria-live="polite">
+          <strong>Idle.</strong>
+          Configure URL and time, then press Start.
+        </div>
+      </div>
+    </div>
+
+    <script src="popup.js" type="module"></script>
+  </body>
+</html>
