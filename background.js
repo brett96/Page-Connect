@@ -33,12 +33,44 @@ const ALARM_PRE_LAUNCH = "pageConnectAlarmPreLaunch";
 
 /** If waiting longer than this until T−60s or until launch, delegate to `chrome.alarms`. */
 const LONG_WAIT_MS = 120_000;
-const T70_MS_BEFORE_TARGET = 70_000;
+/**
+ * OS-level alarm timers can be delayed under power-saving / load.
+ * Use a large runway (T−3 minutes) so we can bridge precisely with JS timers.
+ */
+const T180_MS_BEFORE_TARGET = 180_000;
 /** ~15s runway: SW cold start under load can exceed 1–3s; 2s was too tight. */
 const PRE_LAUNCH_LEAD_MS = 15_000;
+/** Keep-alive heartbeat interval to reduce CDN/keep-alive socket drops. */
+const HEARTBEAT_MS = 8_000;
+/** Stop heartbeats shortly before launch so they don’t contend with navigation. */
+const HEARTBEAT_CUTOFF_MS = 2_000;
 
 /** @type {{ cancel: boolean } | null} */
 let session = null;
+
+/**
+ * OS sleep / low-power states can destroy timer precision.
+ * Request that the display stay awake during the critical countdown windows.
+ */
+let powerLockHeld = false;
+function lockPowerAwake() {
+  try {
+    chrome.power?.requestKeepAwake?.("display");
+    powerLockHeld = true;
+  } catch {
+    /* ignore */
+  }
+}
+function releasePowerAwake() {
+  if (!powerLockHeld) return;
+  try {
+    chrome.power?.releaseKeepAwake?.();
+  } catch {
+    /* ignore */
+  } finally {
+    powerLockHeld = false;
+  }
+}
 
 function notifyStatus(text) {
   chrome.runtime.sendMessage({ type: MSG.STATUS, text }).catch(() => {});
@@ -197,6 +229,7 @@ async function readRunState() {
 }
 
 async function finalizeRunSuccess(message) {
+  releasePowerAwake();
   await clearOurAlarms();
   await chrome.storage.local.remove(RUN_KEY);
   await chrome.storage.local.set({ [ACTIVE_KEY]: false });
@@ -205,6 +238,7 @@ async function finalizeRunSuccess(message) {
 }
 
 async function finalizeRunFailure(message) {
+  releasePowerAwake();
   await clearOurAlarms();
   const st = await chrome.storage.local.get(RUN_KEY);
   const wid = st[RUN_KEY]?.warmupTabId;
@@ -233,8 +267,14 @@ async function createWarmupTab(run, targetUrl) {
   try {
     const targetOrigin = new URL(targetUrl).origin;
     const warmupUrl = `${targetOrigin}/robots.txt`;
-    const tab = await chrome.tabs.create({ url: warmupUrl, active: false });
+    const tab = await chrome.tabs.create({ url: warmupUrl, active: false, muted: true });
     if (tab.id == null) return null;
+    // Resist Chrome Memory Saver tab discarding under heavy RAM pressure.
+    try {
+      await chrome.tabs.update(tab.id, { autoDiscardable: false });
+    } catch {
+      /* not supported on some channels/builds; ignore */
+    }
     await mergeRunState({ warmupTabId: tab.id });
     return tab.id;
   } catch (e) {
@@ -272,6 +312,7 @@ async function navigateToTarget(targetUrl, warmupTabId) {
  * @param {{ targetUrl: string, targetEpochMs: number, warmupTabId?: number | null }} state
  */
 async function executeFromT60(run, state) {
+  lockPowerAwake();
   const { targetUrl, targetEpochMs } = state;
 
   notifyStatus("Opening warmup tab on target origin (robots.txt)…");
@@ -302,7 +343,24 @@ async function executeFromT60(run, state) {
   }
 
   const msUntilLaunch = adjustedLaunchTime - now;
+
+  // Socket heartbeat: keep the CDN/TCP/TLS path warm between the last ping and launch.
+  // Note: this only helps while this worker stays alive for the countdown.
+  let keepSocketHot = true;
+  const heartbeatStopAt = adjustedLaunchTime - HEARTBEAT_CUTOFF_MS;
+  void (async () => {
+    while (keepSocketHot && !run.cancel) {
+      const t = Date.now();
+      if (t >= heartbeatStopAt) break;
+      await delay(Math.min(HEARTBEAT_MS, Math.max(0, heartbeatStopAt - t)), run);
+      if (!keepSocketHot || run.cancel) break;
+      if (Date.now() >= heartbeatStopAt) break;
+      fetch(targetUrl, { method: "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
+    }
+  })();
+
   if (msUntilLaunch > LONG_WAIT_MS) {
+    keepSocketHot = false;
     const when = adjustedLaunchTime - PRE_LAUNCH_LEAD_MS;
     if (when <= Date.now()) {
       await waitUntilEpoch(adjustedLaunchTime, run);
@@ -319,6 +377,7 @@ async function executeFromT60(run, state) {
   }
 
   await waitUntilEpoch(adjustedLaunchTime, run);
+  keepSocketHot = false;
   if (run.cancel) return;
 
   const rs = await readRunState();
@@ -332,6 +391,7 @@ async function executeFromT60(run, state) {
  * @param {{ targetUrl: string, targetEpochMs: number }} job
  */
 async function waitT60AndContinue(run, job) {
+  lockPowerAwake();
   const { targetEpochMs, targetUrl } = job;
   const oneMinuteBefore = targetEpochMs - 60_000;
 
@@ -433,6 +493,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === MSG.CANCEL) {
     void (async () => {
+      releasePowerAwake();
       clearSession();
       await clearOurAlarms();
       const st = await readRunState();
@@ -482,13 +543,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const msUntilT60 = oneMinuteBefore - now;
 
         if (msUntilT60 > LONG_WAIT_MS) {
-          const when = targetEpochMs - T70_MS_BEFORE_TARGET;
+          const when = targetEpochMs - T180_MS_BEFORE_TARGET;
           if (when <= Date.now()) {
             await waitT60AndContinue(run, { targetUrl, targetEpochMs });
           } else {
             await chrome.alarms.create(ALARM_PRE_LATENCY, { when });
             notifyStatus(
-              `Pre-wait is long — scheduled wake-up at T−70s (${new Date(when).toISOString()} UTC). The service worker may sleep until then.`,
+              `Pre-wait is long — scheduled wake-up at T−3m (${new Date(when).toISOString()} UTC). The service worker may sleep until then.`,
             );
             session = null;
           }
