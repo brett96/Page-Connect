@@ -4,6 +4,8 @@
 
 It’s built around the realities of MV3 service workers (they can sleep) and the fact that creating a brand-new tab at the last millisecond adds unpredictable overhead.
 
+**Try it without installing:** a web version runs at [bretttomita.com/page-connect](https://www.bretttomita.com/page-connect). It uses the same warm-up, latency, and launch steps, plus a clock check against the server. The page also links the extension download.
+
 ## What it does
 
 - **You choose**:
@@ -92,8 +94,7 @@ The popup sends a **PING** message on load. If the background is not actually ru
 1. Open **Chrome** and go to `chrome://extensions`
 2. Enable **Developer mode** (top-right toggle)
 3. Click **Load unpacked**
-4. Select this folder:
-   - `C:\Users\brtom\Documents\Page Connect`
+4. Select this folder. If you used **Download extension (.zip)** on [the Page Connect page](https://www.bretttomita.com/page-connect), select the unzipped `Page-Connect-main` folder.
 5. Confirm any permission prompts (the extension requests access to run on all sites so it can measure latency to any URL)
 
 ## Use it
