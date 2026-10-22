@@ -25,6 +25,12 @@ const elUrl = document.getElementById("targetUrl");
 const elDateTime = document.getElementById("targetDateTime");
 /** @type {HTMLSelectElement} */
 const elTimeZone = document.getElementById("timeZone");
+/** @type {HTMLInputElement} */
+const elEmail = document.getElementById("notifyEmail");
+/** @type {HTMLInputElement} */
+const elPhone = document.getElementById("notifyPhone");
+/** @type {HTMLInputElement} */
+const elSmsConsent = document.getElementById("smsConsent");
 /** @type {HTMLButtonElement} */
 const elToggle = document.getElementById("btnToggle");
 /** @type {HTMLDivElement} */
@@ -51,6 +57,19 @@ function isValidHttpPageUrl(raw) {
   } catch {
     return false;
   }
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * US/Canada mobile → E.164 ("+15551234567"), or null. The site re-checks it.
+ * @param {string} raw
+ * @returns {string | null}
+ */
+function normalizeUsPhone(raw) {
+  const digits = raw.replace(/\D/g, "");
+  const ten = digits.length === 11 && digits.startsWith("1") ? digits.slice(1) : digits;
+  return /^[2-9]\d{2}[2-9]\d{6}$/.test(ten) ? `+1${ten}` : null;
 }
 
 /**
@@ -145,6 +164,9 @@ function setRunningUi(running) {
   elUrl.disabled = running;
   elDateTime.disabled = running;
   elTimeZone.disabled = running;
+  elEmail.disabled = running;
+  elPhone.disabled = running;
+  elSmsConsent.disabled = running;
 
   shouldBeRunning = running;
   if (running) {
@@ -177,6 +199,9 @@ async function loadSaved() {
       if (typeof cfg.targetUrl === "string") elUrl.value = cfg.targetUrl;
       if (typeof cfg.targetDateTime === "string") elDateTime.value = cfg.targetDateTime;
       if (typeof cfg.timeZone === "string") elTimeZone.value = cfg.timeZone;
+      if (typeof cfg.notify?.email === "string") elEmail.value = cfg.notify.email;
+      if (typeof cfg.notify?.phoneInput === "string") elPhone.value = cfg.notify.phoneInput;
+      elSmsConsent.checked = cfg.notify?.smsConsent === true;
     }
   } catch (e) {
     console.error("loadSaved", e);
@@ -226,7 +251,27 @@ async function startFlow() {
     return;
   }
 
-  const config = { targetUrl, targetDateTime, timeZone, targetEpochMs, savedAt: now };
+  const email = elEmail.value.trim();
+  if (email && !EMAIL_RE.test(email)) {
+    setBadge("error", "Error");
+    setStatus("Invalid email. Fix it or leave it blank.");
+    return;
+  }
+  const phoneInput = elPhone.value.trim();
+  const phone = phoneInput ? normalizeUsPhone(phoneInput) : null;
+  if (phoneInput && !phone) {
+    setBadge("error", "Error");
+    setStatus("Enter a US or Canada mobile number, or leave it blank.");
+    return;
+  }
+  if (phone && !elSmsConsent.checked) {
+    setBadge("error", "Error");
+    setStatus("Tick the box to agree to texts, or clear the phone number.");
+    return;
+  }
+  const notify = { email, phone: phone ?? "", phoneInput, smsConsent: elSmsConsent.checked };
+
+  const config = { targetUrl, targetDateTime, timeZone, targetEpochMs, notify, savedAt: now };
 
   try {
     await chrome.storage.local.set({ [STORAGE_KEY]: config, [ACTIVE_KEY]: true });

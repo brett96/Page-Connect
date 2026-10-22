@@ -70,6 +70,20 @@ If Chrome crashes or the extension reloads, a stored “active” flag can becom
 
 The popup sends a **PING** message on load. If the background is not actually running (no in-memory session and no alarms), the extension automatically resets the stored active state so the UI doesn’t get stuck.
 
+### Email / SMS alerts (optional)
+Enter an email and/or a US/Canada mobile number (and tick the texting consent box) to get alerts through
+`https://www.bretttomita.com/api/page-connect/notify`. After launch, the launched tab is watched for up to
+30 minutes; on each page load (and single-page-app route change) a small script classifies the page:
+
+- **connected** — sent on the first load of the target page
+- **verify** — the site shows a human check (press-and-hold, CAPTCHA, Cloudflare / Akamai / Imperva / DataDome
+  challenge pages) or a sign-in page. Repeats at most every 5 minutes.
+- **arrived** — the product, cart or checkout page loaded (the target URL itself, a recognised product path, or a
+  visible "Add to cart" / "Buy now" button). Watching stops after this.
+
+Waiting rooms (Queue-it and similar) are recognised and don't alert; you'll get **arrived** when the queue lets you
+through. Page Connect only *notices* these pages; you complete any check yourself.
+
 ## Project structure
 
 - `manifest.json` — MV3 manifest (service worker, permissions, host permissions)
@@ -84,7 +98,7 @@ The popup sends a **PING** message on load. If the background is not actually ru
 - **`alarms`**: schedule long waits reliably in MV3 (wake the service worker)
 - **`windows`**: bring the target Chrome window to the foreground at launch
 - **`power`**: request “keep awake” during the critical countdown windows to avoid OS sleep/throttling
-- **`scripting`**: measure IPC overhead and inject the in-tab heartbeat
+- **`scripting`**: measure IPC overhead, inject the in-tab heartbeat, and classify pages for alerts
 - **Host permissions: `<all_urls>`**: allow `fetch()` latency checks to any target origin
 
 ## Install in Chrome (Unpacked / Developer Mode)
@@ -103,6 +117,7 @@ The popup sends a **PING** message on load. If the background is not actually ru
    - **Target URL** (must be `http(s)`)
    - **Target date/time** (seconds supported)
    - **Timezone** (default Pacific)
+   - Optionally an **email** and/or **phone number** for alerts
 3. Click **Start**
 4. Keep Chrome running until it completes.
 5. At launch time, the warm tab will navigate to your target URL and Chrome should be focused.

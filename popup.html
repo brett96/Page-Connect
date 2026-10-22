@@ -44,6 +44,23 @@
         The datetime is interpreted as wall-clock time in the selected timezone (default Pacific).
       </p>
 
+      <div class="field" style="margin-top: 12px">
+        <label for="notifyEmail">Email me updates (optional)</label>
+        <input id="notifyEmail" type="email" placeholder="you@example.com" autocomplete="email" spellcheck="false" />
+      </div>
+      <div class="field">
+        <label for="notifyPhone">Text me updates (optional, US/Canada)</label>
+        <input id="notifyPhone" type="tel" placeholder="(555) 123-4567" autocomplete="tel" />
+      </div>
+      <label class="consent" for="smsConsent">
+        <input id="smsConsent" type="checkbox" />
+        <span>I agree to receive automated Page Connect texts about this launch at this number. Msg &amp; data rates may apply. Reply STOP to opt out.</span>
+      </label>
+      <p class="hint">
+        Alerts when the page opens, when the site asks you to sign in or complete a human check, and when you reach the
+        product page. Sent through bretttomita.com.
+      </p>
+
       <div class="actions">
         <button type="button" id="btnToggle" class="btn-primary">Start</button>
       </div>

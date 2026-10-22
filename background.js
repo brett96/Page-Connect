@@ -12,6 +12,10 @@
  * 3) Average RTT; failures count as 0 ms for that sample.
  * 4) AdjustedLaunchTime = TargetTime − averageLatencyMs.
  * 5) At AdjustedLaunchTime, `tabs.update` + focus window (or `tabs.create` + focus if warmup failed).
+ * 6) Optional notifications: if the user gave an email and/or phone, the launched tab is watched for
+ *    up to 30 minutes. Each page load is classified in-page (human check / sign-in, waiting room,
+ *    product or checkout page) and bretttomita.com/api/page-connect/notify sends "connected" on the
+ *    first load, "verify" when a check or sign-in needs the user, and "arrived" on the product page.
  */
 
 const MSG = {
@@ -25,6 +29,13 @@ const MSG = {
 const ACTIVE_KEY = "pageConnectActive";
 /** Persisted job while alarms may outlive the worker. */
 const RUN_KEY = "pageConnectRun";
+
+/** Launched tab being watched for notifications: { tabId, targetUrl, notify, sent, until }. */
+const MONITOR_KEY = "pageConnectMonitor";
+const MONITOR_MS = 30 * 60_000;
+/** Don't repeat a "verify" alert for the same tab more often than this. */
+const VERIFY_REPEAT_MS = 5 * 60_000;
+const NOTIFY_ENDPOINT = "https://www.bretttomita.com/api/page-connect/notify";
 
 /** Fires ~10s before T−60s so we can wake, then fine-wait to T−60s. */
 const ALARM_PRE_LATENCY = "pageConnectAlarmPreLatency";
@@ -306,10 +317,12 @@ async function createWarmupTab(run, targetUrl) {
  * @param {number | null | undefined} warmupTabId
  * @param {number | null | undefined} warmupWindowId
  * @param {string | null | undefined} warmupWindowState
+ * @param {NotifyContact | null | undefined} notify
  */
-function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState) {
+function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, notify) {
   if (typeof warmupTabId === "number") {
     chrome.tabs.update(warmupTabId, { url: targetUrl, active: true, muted: false }).catch(() => {});
+    void startMonitor(warmupTabId, targetUrl, notify);
     if (typeof warmupWindowId === "number") {
       // Only restore/focus if we *know* the window was minimized.
       // Avoid focusing/adjusting otherwise; on Windows this can exit fullscreen or resize unexpectedly.
@@ -324,6 +337,7 @@ function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowSt
     .then((newTab) => {
       // Intentionally avoid `chrome.windows.update` here: if the destination window is fullscreen,
       // focusing can cause a resize/exit-fullscreen on some platforms. Activating the tab is enough.
+      if (newTab.id != null) void startMonitor(newTab.id, targetUrl, notify);
     })
     .catch(() => {});
 }
@@ -331,7 +345,7 @@ function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowSt
 /**
  * From T−60s: warmup tab, latency suite, then either schedule pre-launch alarm or launch inline.
  * @param {{ cancel: boolean }} run
- * @param {{ targetUrl: string, targetEpochMs: number, warmupTabId?: number | null }} state
+ * @param {{ targetUrl: string, targetEpochMs: number, warmupTabId?: number | null, notify?: NotifyContact | null }} state
  */
 async function executeFromT60(run, state) {
   lockPowerAwake();
@@ -384,7 +398,7 @@ async function executeFromT60(run, state) {
   const now = Date.now();
   if (adjustedLaunchTime <= now) {
     notifyStatus("Adjusted launch time already passed — navigating now.");
-    navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState);
+    navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state.notify);
     await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
     return;
   }
@@ -445,7 +459,7 @@ async function executeFromT60(run, state) {
     if (when <= Date.now()) {
       await waitUntilEpoch(adjustedLaunchTime, run);
       if (run.cancel) return;
-      navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState);
+      navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state.notify);
       await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
       return;
     }
@@ -459,7 +473,7 @@ async function executeFromT60(run, state) {
   keepSocketHot = false;
   if (run.cancel) return;
 
-  navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState);
+  navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state.notify);
   await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
 }
 
@@ -484,6 +498,176 @@ async function waitT60AndContinue(run, job) {
 
   await executeFromT60(run, { ...st, targetUrl, targetEpochMs });
 }
+
+/**
+ * @typedef {{ email?: string, phone?: string, smsConsent?: boolean }} NotifyContact
+ * @typedef {"connected" | "verify" | "arrived"} NotifyEvent
+ */
+
+/** @param {NotifyContact | null | undefined} notify */
+function hasContact(notify) {
+  return Boolean(notify && (notify.email || (notify.phone && notify.smsConsent)));
+}
+
+/**
+ * Email/SMS via the Page Connect site. Best-effort: a failed alert never affects the run.
+ * @param {NotifyContact} notify
+ * @param {NotifyEvent} event
+ * @param {string} url
+ */
+async function sendNotify(notify, event, url) {
+  try {
+    const res = await fetch(NOTIFY_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        email: notify.email || undefined,
+        phone: notify.smsConsent ? notify.phone || undefined : undefined,
+        smsConsent: notify.smsConsent === true,
+        event,
+        url,
+      }),
+    });
+    if (!res.ok) console.warn(`Notify ${event} failed: HTTP ${res.status}`, await res.text().catch(() => ""));
+  } catch (e) {
+    console.warn(`Notify ${event} failed:`, e);
+  }
+}
+
+/**
+ * Start watching the launched tab. Stored so it survives the worker sleeping; `tabs.onUpdated`
+ * wakes the worker on each navigation.
+ * @param {number} tabId
+ * @param {string} targetUrl
+ * @param {NotifyContact | null | undefined} notify
+ */
+async function startMonitor(tabId, targetUrl, notify) {
+  if (!hasContact(notify)) return;
+  await chrome.storage.local.set({
+    [MONITOR_KEY]: { tabId, targetUrl, notify, sent: {}, until: Date.now() + MONITOR_MS },
+  });
+}
+
+/**
+ * Runs inside the page (must be self-contained). Polls for a few seconds because bot checks and
+ * waiting rooms often render after load. Returns "verify" (human check or sign-in needed),
+ * "queue" (waiting room), "arrived" (product / cart / checkout page) or null.
+ * @param {string} targetUrl
+ */
+async function classifyPage(targetUrl) {
+  const CHALLENGE_SELECTORS = [
+    "#px-captcha", // HUMAN / PerimeterX "press & hold"
+    "#sec-if-cpt-container", // Akamai
+    "#challenge-form",
+    "#challenge-stage", // Cloudflare
+    ".g-recaptcha",
+    ".h-captcha",
+    'iframe[src*="captcha-delivery.com"]', // DataDome
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="hcaptcha.com"]',
+    'iframe[src*="arkoselabs"]',
+    'iframe[src*="funcaptcha"]',
+    'iframe[src*="challenges.cloudflare.com"]',
+    'iframe[src*="_Incapsula_Resource"]', // Imperva
+  ];
+  const CHALLENGE_TEXT =
+    /press (&|and) hold|verify (that )?you('| a)re (a )?human|are you a (robot|human)|robot or human|confirm you('| a)re (not a robot|human)|pardon our interruption|access to this page has been denied|just a moment\.\.\.|checking your browser/i;
+  const QUEUE_TEXT = /waiting ?room|you('| a)re (now )?in (the )?(line|queue)|estimated wait|queue-it/i;
+  const SIGN_IN_PATH = /\/(log-?in|sign-?in|account\/login|ap\/signin)\b/i;
+  const PRODUCT_PATH = /\/(p|ip|dp|product|products|site)\/|\/gp\/product\/|\/(cart|checkout|basket)\b/i;
+  const BUY_TEXT = /^\s*(add to (cart|bag)|buy now|pre-?order( now)?|ship it)\s*$/i;
+
+  const visible = (el) => !!el && el.getClientRects().length > 0;
+  const classify = () => {
+    const title = document.title || "";
+    const head = (document.body?.innerText || "").slice(0, 600);
+    if (CHALLENGE_SELECTORS.some((s) => visible(document.querySelector(s))) || CHALLENGE_TEXT.test(title) || CHALLENGE_TEXT.test(head)) {
+      return "verify";
+    }
+    if (/queue-it\.net$/i.test(location.hostname) || QUEUE_TEXT.test(title) || QUEUE_TEXT.test(head)) return "queue";
+    if (SIGN_IN_PATH.test(location.pathname) || [...document.querySelectorAll('input[type="password"]')].some(visible)) {
+      return "verify";
+    }
+    const target = new URL(targetUrl);
+    const trim = (p) => p.replace(/\/+$/, "");
+    const onTarget =
+      trim(target.pathname) !== "" &&
+      location.hostname.replace(/^www\./, "") === target.hostname.replace(/^www\./, "") &&
+      trim(location.pathname) === trim(target.pathname);
+    const buyButton = [...document.querySelectorAll('button, input[type="submit"], [role="button"]')].some(
+      (b) => visible(b) && BUY_TEXT.test(b.textContent || b.value || ""),
+    );
+    if (onTarget || buyButton || PRODUCT_PATH.test(location.pathname)) return "arrived";
+    return null;
+  };
+
+  let result = null;
+  for (let i = 0; i < 12; i++) {
+    result = classify();
+    if (result === "verify" || result === "queue") return result;
+    await new Promise((r) => setTimeout(r, 500));
+  }
+  return result;
+}
+
+let monitorBusy = false;
+let monitorAgain = false;
+
+/**
+ * Classify the monitored tab's current page and send any alerts not sent yet.
+ * Serialized: a navigation that lands mid-check queues one more pass.
+ * @param {number} tabId
+ */
+async function checkMonitoredTab(tabId) {
+  if (monitorBusy) {
+    monitorAgain = true;
+    return;
+  }
+  monitorBusy = true;
+  try {
+    do {
+      monitorAgain = false;
+      const mon = (await chrome.storage.local.get(MONITOR_KEY))[MONITOR_KEY];
+      if (!mon || mon.tabId !== tabId) return;
+      if (Date.now() > mon.until) {
+        await chrome.storage.local.remove(MONITOR_KEY);
+        return;
+      }
+      const sent = { ...mon.sent };
+      if (!sent.connected) {
+        sent.connected = Date.now();
+        void sendNotify(mon.notify, "connected", mon.targetUrl);
+      }
+
+      let kind = null;
+      try {
+        const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: classifyPage, args: [mon.targetUrl] });
+        kind = res?.result ?? null;
+      } catch (e) {
+        console.warn("classifyPage failed:", e);
+      }
+
+      if (kind === "verify" && (!sent.verify || Date.now() - sent.verify > VERIFY_REPEAT_MS)) {
+        sent.verify = Date.now();
+        void sendNotify(mon.notify, "verify", mon.targetUrl);
+      }
+      if (kind === "arrived" && !sent.arrived) {
+        void sendNotify(mon.notify, "arrived", mon.targetUrl);
+        await chrome.storage.local.remove(MONITOR_KEY);
+        return;
+      }
+      await chrome.storage.local.set({ [MONITOR_KEY]: { ...mon, sent } });
+    } while (monitorAgain);
+  } finally {
+    monitorBusy = false;
+  }
+}
+
+chrome.tabs.onUpdated.addListener((tabId, info) => {
+  // Full loads report "complete"; single-page-app route changes only report a new URL.
+  if (info.status !== "complete" && !info.url) return;
+  void checkMonitoredTab(tabId);
+});
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== ALARM_PRE_LATENCY && alarm.name !== ALARM_PRE_LAUNCH) return;
@@ -538,7 +722,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
           notifyStatus("Cancelled.");
           return;
         }
-        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId, st.warmupWindowState);
+        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId, st.warmupWindowState, st.notify);
         await finalizeRunSuccess("Opened at adjusted time.");
       }
     } catch (e) {
@@ -552,6 +736,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   void (async () => {
+    const mon = (await chrome.storage.local.get(MONITOR_KEY))[MONITOR_KEY];
+    if (mon?.tabId === tabId) await chrome.storage.local.remove(MONITOR_KEY);
     const st = await readRunState();
     if (st && st.warmupTabId === tabId && (await isOrchestrationActive())) {
       await mergeRunState({ warmupTabId: null });
@@ -617,6 +803,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       session = run;
 
       const { targetUrl, targetEpochMs } = payload;
+      const notify = hasContact(payload.notify) ? payload.notify : null;
       const oneMinuteBefore = targetEpochMs - 60_000;
       const now = Date.now();
 
@@ -630,8 +817,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             warmupWindowId: null,
             warmupWindowState: null,
             adjustedLaunchTime: null,
+            notify,
           },
         });
+        // A new run replaces any previous launch's watcher.
+        await chrome.storage.local.remove(MONITOR_KEY);
 
         if (oneMinuteBefore <= now) {
           await finalizeRunFailure("Missed the 1-minute pre-window. Pick a later target time.");
