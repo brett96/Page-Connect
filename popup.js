@@ -3,6 +3,8 @@
  * Validates inputs, persists config, and coordinates with the service worker via messaging.
  */
 
+import { retailerFor } from "./retailers.js";
+
 const STORAGE_KEY = "pageConnectConfig";
 /** Legacy key from pre-rebrand builds — migrated once on load. */
 const LEGACY_STORAGE_KEY = "walmartSniperConfig";
@@ -13,7 +15,11 @@ const MSG = {
   STATUS: "PAGE_CONNECT_STATUS",
   DONE: "PAGE_CONNECT_DONE",
   PING: "PAGE_CONNECT_PING",
+  WATCH: "PAGE_CONNECT_WATCH",
 };
+
+/** How the last stock watch ended (written by watch.js). */
+const WATCH_RESULT_KEY = "pageConnectWatchResult";
 
 const ACTIVE_KEY = "pageConnectActive";
 /** Legacy active flag — cleared when migrating. */
@@ -31,6 +37,16 @@ const elEmail = document.getElementById("notifyEmail");
 const elPhone = document.getElementById("notifyPhone");
 /** @type {HTMLInputElement} */
 const elSmsConsent = document.getElementById("smsConsent");
+/** @type {HTMLInputElement} */
+const elModeWatch = document.getElementById("modeWatch");
+/** @type {HTMLInputElement} */
+const elModeTime = document.getElementById("modeTime");
+/** @type {HTMLInputElement} */
+const elAutoCart = document.getElementById("autoCart");
+/** @type {HTMLSelectElement} */
+const elInterval = document.getElementById("watchInterval");
+/** @type {HTMLAnchorElement} */
+const elResultLink = document.getElementById("resultLink");
 /** @type {HTMLButtonElement} */
 const elToggle = document.getElementById("btnToggle");
 /** @type {HTMLDivElement} */
@@ -160,7 +176,32 @@ function setBadge(state, label) {
   elBadge.classList.add(state === "running" ? "badge-running" : state === "error" ? "badge-error" : "badge-idle");
 }
 
+/** Show the fields for the chosen mode; "add to cart" needs a supported store's URL. */
+function syncModeUi() {
+  const watch = elModeWatch.checked;
+  document.getElementById("timeRow").hidden = watch;
+  document.getElementById("timeHint").hidden = watch;
+  document.getElementById("intervalRow").hidden = !watch;
+  const retailer = retailerFor(elUrl.value);
+  elAutoCart.disabled = shouldBeRunning || !retailer;
+  document.getElementById("autoCartLabel").textContent = retailer
+    ? `Add it to my ${retailer.name} cart when it's available, then alert me with a link to my cart.`
+    : "Add it to my cart when it's available, then alert me with a link to my cart.";
+}
+
+/** "Open cart" / "Open product page" button after a watch found the item. */
+function showResultLink(result) {
+  const show = Boolean(result?.link) && (result.kind === "carted" || result.kind === "instock");
+  elResultLink.hidden = !show;
+  if (!show) return;
+  elResultLink.href = result.link;
+  elResultLink.textContent = result.kind === "carted" ? "Open cart & check out" : "Open product page";
+}
+
 function setRunningUi(running) {
+  elModeTime.disabled = running;
+  elModeWatch.disabled = running;
+  elInterval.disabled = running;
   elUrl.disabled = running;
   elDateTime.disabled = running;
   elTimeZone.disabled = running;
@@ -169,6 +210,7 @@ function setRunningUi(running) {
   elSmsConsent.disabled = running;
 
   shouldBeRunning = running;
+  syncModeUi();
   if (running) {
     elToggle.textContent = "Stop";
     elToggle.classList.remove("btn-primary");
@@ -202,6 +244,10 @@ async function loadSaved() {
       if (typeof cfg.notify?.email === "string") elEmail.value = cfg.notify.email;
       if (typeof cfg.notify?.phoneInput === "string") elPhone.value = cfg.notify.phoneInput;
       elSmsConsent.checked = cfg.notify?.smsConsent === true;
+      elModeWatch.checked = cfg.mode === "watch";
+      elModeTime.checked = cfg.mode !== "watch";
+      elAutoCart.checked = cfg.autoCart === true;
+      if (cfg.intervalSec) elInterval.value = String(cfg.intervalSec);
     }
   } catch (e) {
     console.error("loadSaved", e);
@@ -223,32 +269,43 @@ async function startFlow() {
     setStatus("Invalid URL. Use an http(s) link, e.g. https://example.com/…");
     return;
   }
-  if (!targetDateTime) {
+  const mode = elModeWatch.checked ? "watch" : "time";
+  const retailer = retailerFor(targetUrl);
+  if (mode === "watch" && !retailer) {
     setBadge("error", "Error");
-    setStatus("Please choose a target date and time.");
+    setStatus("Stock watch needs a product page on a supported store (see the list above).");
     return;
   }
-
-  const targetEpochMs = zonedLocalToUtcMs(targetDateTime, timeZone);
-  if (targetEpochMs == null || !Number.isFinite(targetEpochMs)) {
-    setBadge("error", "Error");
-    setStatus("Could not parse the target time for the selected timezone.");
-    return;
-  }
-
   const now = Date.now();
-  if (targetEpochMs <= now) {
-    setBadge("error", "Error");
-    setStatus("Target time must be in the future.");
-    return;
-  }
+  let targetEpochMs = null;
 
-  // Need at least ~1 minute + ping window headroom (Phase 2 starts at T-60s, pings take ~30s).
-  const minLead = 65_000;
-  if (targetEpochMs - now < minLead) {
-    setBadge("error", "Error");
-    setStatus(`Target must be at least ${Math.ceil(minLead / 1000)} seconds from now (pre-wait + latency pings).`);
-    return;
+  if (mode === "time") {
+    if (!targetDateTime) {
+      setBadge("error", "Error");
+      setStatus("Please choose a target date and time.");
+      return;
+    }
+
+    targetEpochMs = zonedLocalToUtcMs(targetDateTime, timeZone);
+    if (targetEpochMs == null || !Number.isFinite(targetEpochMs)) {
+      setBadge("error", "Error");
+      setStatus("Could not parse the target time for the selected timezone.");
+      return;
+    }
+
+    if (targetEpochMs <= now) {
+      setBadge("error", "Error");
+      setStatus("Target time must be in the future.");
+      return;
+    }
+
+    // Need at least ~1 minute + ping window headroom (Phase 2 starts at T-60s, pings take ~30s).
+    const minLead = 65_000;
+    if (targetEpochMs - now < minLead) {
+      setBadge("error", "Error");
+      setStatus(`Target must be at least ${Math.ceil(minLead / 1000)} seconds from now (pre-wait + latency pings).`);
+      return;
+    }
   }
 
   const email = elEmail.value.trim();
@@ -271,10 +328,21 @@ async function startFlow() {
   }
   const notify = { email, phone: phone ?? "", phoneInput, smsConsent: elSmsConsent.checked };
 
-  const config = { targetUrl, targetDateTime, timeZone, targetEpochMs, notify, savedAt: now };
+  const config = {
+    mode,
+    targetUrl,
+    targetDateTime,
+    timeZone,
+    targetEpochMs,
+    autoCart: Boolean(retailer) && elAutoCart.checked,
+    intervalSec: Number(elInterval.value) || 60,
+    notify,
+    savedAt: now,
+  };
+  showResultLink(null);
 
   try {
-    await chrome.storage.local.set({ [STORAGE_KEY]: config, [ACTIVE_KEY]: true });
+    await chrome.storage.local.set({ [STORAGE_KEY]: config, [ACTIVE_KEY]: mode === "time" });
   } catch (e) {
     console.error("storage set", e);
     setBadge("error", "Error");
@@ -283,10 +351,15 @@ async function startFlow() {
   }
 
   setRunningUi(true);
-  setStatus("Starting scheduled connect…");
+  setStatus(mode === "watch" ? "Starting stock watch…" : "Starting scheduled connect…");
 
   try {
-    await chrome.runtime.sendMessage({ type: MSG.START, payload: config });
+    const res = await chrome.runtime.sendMessage({ type: MSG.START, payload: config });
+    if (res?.ok === false) {
+      setRunningUi(false);
+      setBadge("error", "Error");
+      setStatus(res.error || "Could not start.");
+    }
   } catch (e) {
     console.error("sendMessage", e);
     setBadge("error", "Error");
@@ -335,9 +408,34 @@ chrome.runtime.onMessage.addListener((msg) => {
       setBadge("idle", "Idle");
       if (typeof msg.text === "string") setStatus(msg.text);
       else setIdle("Ready.");
+      // A launch with "add to cart" hands over to the stock watch.
+      void showWatchIfRunning();
+    }
+  }
+  if (msg.type === MSG.WATCH) {
+    if (msg.watching) {
+      setRunningUi(true);
+      setBadge("running", "Watching");
+      if (typeof msg.text === "string") setStatus(msg.text);
+    } else if (msg.kind !== "stopped") {
+      // ("stopped" comes from this popup's own Stop / Start, which already updated the UI.)
+      setRunningUi(false);
+      setBadge("idle", "Idle");
+      if (typeof msg.text === "string") setStatus(msg.text);
+      showResultLink(msg);
     }
   }
 });
+
+/** @returns {Promise<boolean>} true if a stock watch is running (and the UI now shows it). */
+async function showWatchIfRunning() {
+  const res = await chrome.runtime.sendMessage({ type: MSG.PING }).catch(() => null);
+  if (!res?.watching) return false;
+  setRunningUi(true);
+  setBadge("running", "Watching");
+  setStatus(res.watchText || "Watching for stock…");
+  return true;
+}
 
 /**
  * Aligns the popup with the service worker so a stale `pageConnectActive` flag after reload/crash
@@ -351,8 +449,20 @@ async function syncRunningStateWithBackground() {
       setStatus("Connect sequence in progress…");
       return;
     }
+    if (res?.watching) {
+      setRunningUi(true);
+      setBadge("running", "Watching");
+      setStatus(res.watchText || "Watching for stock…");
+      return;
+    }
     setRunningUi(false);
-    setIdle("Configure URL and time, then press Start.");
+    const last = (await chrome.storage.local.get(WATCH_RESULT_KEY))[WATCH_RESULT_KEY];
+    if (last?.text && Date.now() - last.at < 12 * 60 * 60_000) {
+      setStatus(last.text);
+      showResultLink(last);
+    } else {
+      setIdle("Configure URL and time, then press Start.");
+    }
   } catch {
     await chrome.storage.local.set({ [ACTIVE_KEY]: false });
     setBadge("error", "Error");
@@ -361,8 +471,13 @@ async function syncRunningStateWithBackground() {
   }
 }
 
+elModeTime.addEventListener("change", syncModeUi);
+elModeWatch.addEventListener("change", syncModeUi);
+elUrl.addEventListener("input", syncModeUi);
+
 (async () => {
   await loadSaved();
+  syncModeUi();
   setBadge("idle", "Idle");
   await syncRunningStateWithBackground();
 })();

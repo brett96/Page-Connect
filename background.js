@@ -16,7 +16,23 @@
  *    up to 30 minutes. Each page load is classified in-page (human check / sign-in, waiting room,
  *    product or checkout page) and bretttomita.com/api/page-connect/notify sends "connected" on the
  *    first load, "verify" when a check or sign-in needs the user, and "arrived" on the product page.
+ * 7) Stock watch (watch.js): on supported retail sites, keep re-checking a product page and add the
+ *    item to the cart when it becomes available — either straight away ("watch" mode) or on the
+ *    tab a scheduled launch just opened.
  */
+
+import { retailerFor } from "./retailers.js";
+import { PAGE_SIGNALS, hasContact, sendNotify } from "./shared.js";
+import {
+  WATCH_ALARM,
+  getWatch,
+  handleNotificationClick,
+  handleWatchAlarm,
+  handleWatchTabRemoved,
+  runCheck,
+  startWatch,
+  stopWatch,
+} from "./watch.js";
 
 const MSG = {
   START: "PAGE_CONNECT_START",
@@ -35,7 +51,6 @@ const MONITOR_KEY = "pageConnectMonitor";
 const MONITOR_MS = 30 * 60_000;
 /** Don't repeat a "verify" alert for the same tab more often than this. */
 const VERIFY_REPEAT_MS = 5 * 60_000;
-const NOTIFY_ENDPOINT = "https://www.bretttomita.com/api/page-connect/notify";
 
 /** Fires ~10s before T−60s so we can wake, then fine-wait to T−60s. */
 const ALARM_PRE_LATENCY = "pageConnectAlarmPreLatency";
@@ -123,7 +138,8 @@ async function handlePing() {
     await chrome.storage.local.set({ [ACTIVE_KEY]: false });
     await chrome.storage.local.remove(RUN_KEY);
   }
-  return { isRunning: running };
+  const watch = await getWatch();
+  return { isRunning: running, watching: Boolean(watch), watchText: watch?.statusText ?? null };
 }
 
 /**
@@ -285,8 +301,10 @@ async function createWarmupTab(run, targetUrl) {
     // Use a unique fake path so most servers return a lightweight 404 HTML page.
     // This lets us inject an in-tab heartbeat that warms the *tab's* network partition.
     const warmupUrl = `${targetOrigin}/_page_connect_warmup_${Date.now()}`;
-    const tab = await chrome.tabs.create({ url: warmupUrl, active: false, muted: true });
+    // (`muted` is not a `tabs.create` option; passing it makes the call throw.)
+    const tab = await chrome.tabs.create({ url: warmupUrl, active: false });
     if (tab.id == null) return null;
+    chrome.tabs.update(tab.id, { muted: true }).catch(() => {});
     // Resist Chrome Memory Saver tab discarding under heavy RAM pressure.
     try {
       await chrome.tabs.update(tab.id, { autoDiscardable: false });
@@ -317,12 +335,18 @@ async function createWarmupTab(run, targetUrl) {
  * @param {number | null | undefined} warmupTabId
  * @param {number | null | undefined} warmupWindowId
  * @param {string | null | undefined} warmupWindowState
- * @param {NotifyContact | null | undefined} notify
+ * @param {{ notify?: NotifyContact | null, watch?: { intervalSec: number } | null }} job
  */
-function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, notify) {
+function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, job) {
+  const notify = job?.notify;
+  // Retail drop with "add to cart": the stock watch takes over the launched tab.
+  const watchTab = (tabId) => {
+    if (job?.watch) void startWatch({ url: targetUrl, tabId, autoCart: true, intervalSec: job.watch.intervalSec, notify });
+  };
   if (typeof warmupTabId === "number") {
     chrome.tabs.update(warmupTabId, { url: targetUrl, active: true, muted: false }).catch(() => {});
     void startMonitor(warmupTabId, targetUrl, notify);
+    watchTab(warmupTabId);
     if (typeof warmupWindowId === "number") {
       // Only restore/focus if we *know* the window was minimized.
       // Avoid focusing/adjusting otherwise; on Windows this can exit fullscreen or resize unexpectedly.
@@ -337,7 +361,10 @@ function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowSt
     .then((newTab) => {
       // Intentionally avoid `chrome.windows.update` here: if the destination window is fullscreen,
       // focusing can cause a resize/exit-fullscreen on some platforms. Activating the tab is enough.
-      if (newTab.id != null) void startMonitor(newTab.id, targetUrl, notify);
+      if (newTab.id != null) {
+        void startMonitor(newTab.id, targetUrl, notify);
+        watchTab(newTab.id);
+      }
     })
     .catch(() => {});
 }
@@ -345,7 +372,7 @@ function navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowSt
 /**
  * From T−60s: warmup tab, latency suite, then either schedule pre-launch alarm or launch inline.
  * @param {{ cancel: boolean }} run
- * @param {{ targetUrl: string, targetEpochMs: number, warmupTabId?: number | null, notify?: NotifyContact | null }} state
+ * @param {{ targetUrl: string, targetEpochMs: number, warmupTabId?: number | null, notify?: NotifyContact | null, watch?: { intervalSec: number } | null }} state
  */
 async function executeFromT60(run, state) {
   lockPowerAwake();
@@ -398,7 +425,7 @@ async function executeFromT60(run, state) {
   const now = Date.now();
   if (adjustedLaunchTime <= now) {
     notifyStatus("Adjusted launch time already passed — navigating now.");
-    navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state.notify);
+    navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state);
     await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
     return;
   }
@@ -459,7 +486,7 @@ async function executeFromT60(run, state) {
     if (when <= Date.now()) {
       await waitUntilEpoch(adjustedLaunchTime, run);
       if (run.cancel) return;
-      navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state.notify);
+      navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state);
       await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
       return;
     }
@@ -473,7 +500,7 @@ async function executeFromT60(run, state) {
   keepSocketHot = false;
   if (run.cancel) return;
 
-  navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state.notify);
+  navigateToTarget(targetUrl, warmupTabId, warmupWindowId, warmupWindowState, state);
   await finalizeRunSuccess(`Opened at adjusted time (avg latency ${avgLatency.toFixed(1)} ms).`);
 }
 
@@ -499,40 +526,7 @@ async function waitT60AndContinue(run, job) {
   await executeFromT60(run, { ...st, targetUrl, targetEpochMs });
 }
 
-/**
- * @typedef {{ email?: string, phone?: string, smsConsent?: boolean }} NotifyContact
- * @typedef {"connected" | "verify" | "arrived"} NotifyEvent
- */
-
-/** @param {NotifyContact | null | undefined} notify */
-function hasContact(notify) {
-  return Boolean(notify && (notify.email || (notify.phone && notify.smsConsent)));
-}
-
-/**
- * Email/SMS via the Page Connect site. Best-effort: a failed alert never affects the run.
- * @param {NotifyContact} notify
- * @param {NotifyEvent} event
- * @param {string} url
- */
-async function sendNotify(notify, event, url) {
-  try {
-    const res = await fetch(NOTIFY_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        email: notify.email || undefined,
-        phone: notify.smsConsent ? notify.phone || undefined : undefined,
-        smsConsent: notify.smsConsent === true,
-        event,
-        url,
-      }),
-    });
-    if (!res.ok) console.warn(`Notify ${event} failed: HTTP ${res.status}`, await res.text().catch(() => ""));
-  } catch (e) {
-    console.warn(`Notify ${event} failed:`, e);
-  }
-}
+/** @typedef {import("./shared.js").NotifyContact} NotifyContact */
 
 /**
  * Start watching the launched tab. Stored so it survives the worker sleeping; `tabs.onUpdated`
@@ -553,27 +547,13 @@ async function startMonitor(tabId, targetUrl, notify) {
  * waiting rooms often render after load. Returns "verify" (human check or sign-in needed),
  * "queue" (waiting room), "arrived" (product / cart / checkout page) or null.
  * @param {string} targetUrl
+ * @param {typeof PAGE_SIGNALS} signals
  */
-async function classifyPage(targetUrl) {
-  const CHALLENGE_SELECTORS = [
-    "#px-captcha", // HUMAN / PerimeterX "press & hold"
-    "#sec-if-cpt-container", // Akamai
-    "#challenge-form",
-    "#challenge-stage", // Cloudflare
-    ".g-recaptcha",
-    ".h-captcha",
-    'iframe[src*="captcha-delivery.com"]', // DataDome
-    'iframe[src*="recaptcha"]',
-    'iframe[src*="hcaptcha.com"]',
-    'iframe[src*="arkoselabs"]',
-    'iframe[src*="funcaptcha"]',
-    'iframe[src*="challenges.cloudflare.com"]',
-    'iframe[src*="_Incapsula_Resource"]', // Imperva
-  ];
-  const CHALLENGE_TEXT =
-    /press (&|and) hold|verify (that )?you('| a)re (a )?human|are you a (robot|human)|robot or human|confirm you('| a)re (not a robot|human)|pardon our interruption|access to this page has been denied|just a moment\.\.\.|checking your browser/i;
-  const QUEUE_TEXT = /waiting ?room|you('| a)re (now )?in (the )?(line|queue)|estimated wait|queue-it/i;
-  const SIGN_IN_PATH = /\/(log-?in|sign-?in|account\/login|ap\/signin)\b/i;
+async function classifyPage(targetUrl, signals) {
+  const CHALLENGE_SELECTORS = signals.challengeSelectors;
+  const CHALLENGE_TEXT = new RegExp(signals.challengeText, "i");
+  const QUEUE_TEXT = new RegExp(signals.queueText, "i");
+  const SIGN_IN_PATH = new RegExp(signals.signInPath, "i");
   const PRODUCT_PATH = /\/(p|ip|dp|product|products|site)\/|\/gp\/product\/|\/(cart|checkout|basket)\b/i;
   const BUY_TEXT = /^\s*(add to (cart|bag)|buy now|pre-?order( now)?|ship it)\s*$/i;
 
@@ -641,7 +621,7 @@ async function checkMonitoredTab(tabId) {
 
       let kind = null;
       try {
-        const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: classifyPage, args: [mon.targetUrl] });
+        const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: classifyPage, args: [mon.targetUrl, PAGE_SIGNALS] });
         kind = res?.result ?? null;
       } catch (e) {
         console.warn("classifyPage failed:", e);
@@ -667,9 +647,16 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
   // Full loads report "complete"; single-page-app route changes only report a new URL.
   if (info.status !== "complete" && !info.url) return;
   void checkMonitoredTab(tabId);
+  void runCheck(tabId);
 });
 
+chrome.notifications?.onClicked.addListener((id) => void handleNotificationClick(id));
+
 chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === WATCH_ALARM) {
+    void handleWatchAlarm();
+    return;
+  }
   if (alarm.name !== ALARM_PRE_LATENCY && alarm.name !== ALARM_PRE_LAUNCH) return;
 
   void (async () => {
@@ -722,7 +709,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
           notifyStatus("Cancelled.");
           return;
         }
-        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId, st.warmupWindowState, st.notify);
+        navigateToTarget(st.targetUrl, st.warmupTabId, st.warmupWindowId, st.warmupWindowState, st);
         await finalizeRunSuccess("Opened at adjusted time.");
       }
     } catch (e) {
@@ -738,6 +725,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   void (async () => {
     const mon = (await chrome.storage.local.get(MONITOR_KEY))[MONITOR_KEY];
     if (mon?.tabId === tabId) await chrome.storage.local.remove(MONITOR_KEY);
+    await handleWatchTabRemoved(tabId);
     const st = await readRunState();
     if (st && st.warmupTabId === tabId && (await isOrchestrationActive())) {
       await mergeRunState({ warmupTabId: null });
@@ -759,6 +747,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       releasePowerAwake();
       clearSession();
       await clearOurAlarms();
+      await stopWatch();
       const st = await readRunState();
       if (st?.warmupTabId != null) {
         try {
@@ -790,20 +779,44 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === MSG.START) {
     const payload = msg.payload;
-    if (!payload || typeof payload.targetUrl !== "string" || typeof payload.targetEpochMs !== "number") {
+    const watchNow = payload?.mode === "watch";
+    if (!payload || typeof payload.targetUrl !== "string" || (!watchNow && typeof payload.targetEpochMs !== "number")) {
       sendResponse?.({ ok: false, error: "Invalid payload" });
       return;
+    }
+
+    // "Watch" mode: no schedule — start checking the product page now.
+    if (watchNow) {
+      void (async () => {
+        clearSession();
+        await clearOurAlarms();
+        await stopWatch();
+        await chrome.storage.local.remove([RUN_KEY, MONITOR_KEY]);
+        await chrome.storage.local.set({ [ACTIVE_KEY]: false });
+        sendResponse(
+          await startWatch({
+            url: payload.targetUrl,
+            autoCart: payload.autoCart !== false,
+            intervalSec: payload.intervalSec,
+            notify: payload.notify,
+          }),
+        );
+      })();
+      return true;
     }
 
     void (async () => {
       clearSession();
       await clearOurAlarms();
+      await stopWatch();
 
       const run = { cancel: false };
       session = run;
 
       const { targetUrl, targetEpochMs } = payload;
       const notify = hasContact(payload.notify) ? payload.notify : null;
+      // Timed launch on a retail site with "add to cart" ticked: watch the tab once it opens.
+      const watch = payload.autoCart === true && retailerFor(targetUrl) ? { intervalSec: payload.intervalSec } : null;
       const oneMinuteBefore = targetEpochMs - 60_000;
       const now = Date.now();
 
@@ -818,6 +831,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             warmupWindowState: null,
             adjustedLaunchTime: null,
             notify,
+            watch,
           },
         });
         // A new run replaces any previous launch's watcher.
