@@ -5,7 +5,9 @@
  * It works in the user's own tab and session, like a person refreshing the page:
  *   - one page load per interval (30 s minimum), no parallel sessions, quantity as the page defaults;
  *   - a human check, sign-in page or waiting room pauses the watch (no reloads, so a queue spot is
- *     kept) and alerts the user, who completes it themselves;
+ *     kept). For a check, the tab is brought to the front with a chime and a desktop notification
+ *     (repeated each minute until it's done) and the user completes it themselves. While paused the
+ *     page is re-read every couple of seconds, without reloading, so the watch resumes right after;
  *   - it stops at the cart. Checkout and payment are left to the user.
  *
  * State lives in `chrome.storage.local` and ticks come from `chrome.alarms`, so the watch survives
@@ -14,6 +16,7 @@
 
 import { retailerFor } from "./retailers.js";
 import { PAGE_SIGNALS, hasContact, sendNotify } from "./shared.js";
+import { ATTENTION_REPEAT_MS, REMOTE_VERIFY_MAX, REMOTE_VERIFY_MS, clearAttention, demandAttention } from "./attention.js";
 
 export const MSG_WATCH = "PAGE_CONNECT_WATCH";
 /** Active watch: see `startWatch` for the shape. */
@@ -24,7 +27,8 @@ export const WATCH_ALARM = "pageConnectWatchTick";
 
 export const MIN_INTERVAL_SEC = 30;
 const WATCH_MAX_MS = 24 * 60 * 60_000;
-const VERIFY_REPEAT_MS = 5 * 60_000;
+/** While paused on a check or waiting room, re-read the page (no reload) this often. */
+const HOLD_RECHECK_MS = 2_000;
 /** After this many presses without a confirmed add, stop pressing and just alert. */
 const MAX_CLICKS = 3;
 const NOTIFICATION_ID = "pageConnectWatch";
@@ -81,7 +85,11 @@ export async function startWatch(opts) {
       /** Don't reload: the page is waiting on the user or on a queue. */
       hold: false,
       lastState: null,
+      /** Last email/text about a check, and how many were sent for the current one. */
       verifyAt: 0,
+      verifySent: 0,
+      /** Last desktop alert about a check. */
+      attentionAt: 0,
       statusText,
     },
   });
@@ -109,6 +117,8 @@ function keepAwake() {
  */
 async function finish(kind, watch, title) {
   const w = watch ?? (await getWatch());
+  if (holdTimer) clearTimeout(holdTimer);
+  holdTimer = null;
   await chrome.alarms.clear(WATCH_ALARM);
   await chrome.storage.local.remove(WATCH_KEY);
   try {
@@ -117,6 +127,7 @@ async function finish(kind, watch, title) {
     /* ignore */
   }
   if (!w) return;
+  void clearAttention(w.tabId);
 
   const retailer = retailerFor(w.url);
   const shop = retailer?.name ?? "the store";
@@ -320,6 +331,23 @@ export async function watchPage(cfg) {
 
 let busy = false;
 let again = false;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let holdTimer = null;
+
+/**
+ * Paused on a check or waiting room: look again shortly (reading the page, not reloading it), so
+ * the add to cart happens within seconds of the check being cleared. If the worker is suspended
+ * meanwhile, the next alarm tick picks this back up.
+ * @param {number} tabId
+ */
+function scheduleHoldCheck(tabId) {
+  if (holdTimer) return;
+  holdTimer = setTimeout(async () => {
+    holdTimer = null;
+    const w = await getWatch();
+    if (w?.hold && w.tabId === tabId) await runCheck(tabId);
+  }, HOLD_RECHECK_MS);
+}
 
 /**
  * Inspect the watched tab's current page and act on what it shows. Serialized: a navigation that
@@ -380,7 +408,8 @@ export async function runCheck(tabId) {
       const cur = await getWatch();
       if (!cur || cur.tabId !== tabId || cur.until !== w.until) return;
 
-      const next = { ...w, checks: w.checks + 1, clicks: w.clicks + (res.clicked ? 1 : 0), lastState: res.state };
+      // Quick re-reads of a paused page aren't counted as checks.
+      const next = { ...w, checks: w.checks + (w.hold ? 0 : 1), clicks: w.clicks + (res.clicked ? 1 : 0), lastState: res.state };
       if (res.state === "carted") {
         await finish("carted", next, res.title);
         return;
@@ -391,12 +420,31 @@ export async function runCheck(tabId) {
       }
 
       next.hold = res.state === "verify" || res.state === "queue";
-      if (res.state === "verify" && w.notify && Date.now() - w.verifyAt > VERIFY_REPEAT_MS) {
-        next.verifyAt = Date.now();
-        void sendNotify(w.notify, "verify", w.url);
+      if (res.state === "verify") {
+        const now = Date.now();
+        if (now - (w.attentionAt ?? 0) > ATTENTION_REPEAT_MS) {
+          next.attentionAt = now;
+          void demandAttention(
+            tabId,
+            `${retailer.name} needs you`,
+            "Sign in or complete the check in this tab. The watch carries on as soon as you're done.",
+          );
+        }
+        const sentCount = w.verifySent ?? 0;
+        if (w.notify && sentCount < REMOTE_VERIFY_MAX && now - (w.verifyAt ?? 0) > REMOTE_VERIFY_MS) {
+          next.verifyAt = now;
+          next.verifySent = sentCount + 1;
+          void sendNotify(w.notify, "verify", w.url);
+        }
+      } else if (w.lastState === "verify") {
+        // Check cleared: take the alert down and start fresh for the next one.
+        next.attentionAt = 0;
+        next.verifyAt = 0;
+        next.verifySent = 0;
+        void clearAttention(tabId);
       }
       const what = {
-        verify: "the site is asking you to sign in or complete a check. Do that in the watched tab; it won't be reloaded meanwhile",
+        verify: "the site is asking you to sign in or complete a check. Do that in the watched tab (it won't be reloaded); the watch resumes within seconds of you finishing",
         queue: "in a waiting room / being held by the site. Leaving the tab alone",
         oos: "not available yet",
         unknown: "no add-to-cart button on the page yet",
@@ -407,6 +455,7 @@ export async function runCheck(tabId) {
       next.statusText = `Watching ${retailer.name} — ${clock()}: ${what}. (${next.checks} check${next.checks === 1 ? "" : "s"}, every ${w.intervalSec}s)`;
       await chrome.storage.local.set({ [WATCH_KEY]: next });
       broadcast(true, next.statusText);
+      if (next.hold) scheduleHoldCheck(tabId);
     } while (again);
   } finally {
     clearInterval(alive);

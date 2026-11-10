@@ -97,9 +97,11 @@ Target, Walmart, Sam's Club, Best Buy, Costco, GameStop and Amazon.
 - If the press can't be confirmed (an options dialog, a site change), or you leave **Add it to my cart** unticked,
   you get an **instock** alert with a link to the product page instead.
 - **You check out and pay.** Nothing past the cart is automated.
-- A sign-in page, human check or waiting room pauses the watch: the tab is not reloaded (so a queue spot is kept),
-  you get a **verify** alert, and the watch carries on once you've dealt with it. Best Buy's "Please wait" hold after
-  a press is handled the same way.
+- A sign-in page, human check or waiting room pauses the watch: the tab is not reloaded (so a queue spot is kept).
+  While paused, the page is re-read every 2 seconds (without reloading), so the add to cart happens within seconds
+  of a check being cleared or a hold ending. Best Buy's "Please wait" hold after a press is handled the same way.
+- **You complete human checks yourself** — Page Connect doesn't solve or bypass them. It gets them in front of you
+  fast instead (see below).
 - The button is only ever pressed on the product page you entered (same path, or the same item number after a
   redirect), never on another product's button in a carousel or on a page the store redirected to.
 
@@ -111,12 +113,30 @@ is otherwise found by its text ("Add to cart", "Ship it", "Pre-order"), so updat
 Carts belong to your browser session: the emailed cart link shows the item in the browser running the extension, or
 on another device signed in to the same store account.
 
+### When a site needs you (sign-in or human check)
+Whenever a watched page, a drop's prep tab, or a launched page shows a sign-in page or a human check
+(press-and-hold, CAPTCHA, Cloudflare / Akamai / Imperva / DataDome challenge):
+
+- The tab is switched to and its window brought to the front, a chime plays, and a desktop notification stays up
+  until you click or dismiss it (clicking it takes you to the tab).
+- The desktop alert repeats every minute until the check is gone, and is skipped while you're already on that tab.
+- With an email/phone set, a **verify** alert is sent right away and then at most every 5 minutes, up to 3 per check
+  (the alert service allows about 10 per hour per recipient, which keeps room for the cart-ready alert).
+
+### Retail drops: sign in at T−5 minutes
+For a timed launch on a supported store, the store's homepage opens in a tab **5 minutes early** (with an alert) so
+you can sign in and clear any check while nothing is at stake. That tab is watched for checks, is never reloaded, and
+becomes the launch tab at T−0. Latency is timed with plain `GET`s for a static file (`pingPath`) rather than `HEAD`
+requests or a made-up 404 page, which store firewalls tend to treat as bot traffic.
+
 ## Project structure
 
 - `manifest.json` — MV3 manifest (service worker, permissions, host permissions)
 - `background.js` — the scheduling engine (alarms, pings, adjusted launch, warm tab)
 - `watch.js` — the stock watch (interval reloads, in-page add to cart, cart-ready alerts)
 - `retailers.js` — supported stores: domains, cart URLs, buy-box selectors
+- `attention.js` — bringing a tab that needs you to the front: focus, chime, desktop notification
+- `offscreen.html` / `offscreen.js` — plays the chime (a service worker can't play audio)
 - `shared.js` — alert sending and the human-check / waiting-room signals both engines use
 - `popup.html` / `popup.css` — dark-mode UI
 - `popup.js` — input validation, timezone → epoch conversion, messaging, status UI
@@ -130,7 +150,8 @@ on another device signed in to the same store account.
 - **`power`**: request “keep awake” during the critical countdown windows to avoid OS sleep/throttling
 - **`scripting`**: measure IPC overhead, inject the in-tab heartbeat, classify pages for alerts, and check /
   press the buy button during a stock watch
-- **`notifications`**: the desktop "your cart is ready" notification
+- **`notifications`**: desktop "your cart is ready" and "this site needs you" notifications
+- **`offscreen`**: a hidden page that plays the chime
 - **Host permissions: `<all_urls>`**: allow `fetch()` latency checks to any target origin
 
 ## Install in Chrome (Unpacked / Developer Mode)

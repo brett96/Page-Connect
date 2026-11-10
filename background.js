@@ -16,6 +16,10 @@
  *    up to 30 minutes. Each page load is classified in-page (human check / sign-in, waiting room,
  *    product or checkout page) and bretttomita.com/api/page-connect/notify sends "connected" on the
  *    first load, "verify" when a check or sign-in needs the user, and "arrived" on the product page.
+ * Retail drops (retailers.js): the store's homepage opens at T−5 min so the user can sign in and
+ * clear any human check while nothing is at stake. That tab is watched for checks (attention.js
+ * brings it to the front with a chime and a desktop notification) and then becomes the launch tab;
+ * it isn't reloaded, and latency is timed with GETs for a static asset.
  * 7) Stock watch (watch.js): on supported retail sites, keep re-checking a product page and add the
  *    item to the cart when it becomes available — either straight away ("watch" mode) or on the
  *    tab a scheduled launch just opened.
@@ -23,6 +27,14 @@
 
 import { retailerFor } from "./retailers.js";
 import { PAGE_SIGNALS, hasContact, sendNotify } from "./shared.js";
+import {
+  ATTENTION_REPEAT_MS,
+  REMOTE_VERIFY_MAX,
+  REMOTE_VERIFY_MS,
+  clearAttention,
+  demandAttention,
+  handleAttentionClick,
+} from "./attention.js";
 import {
   WATCH_ALARM,
   getWatch,
@@ -49,11 +61,12 @@ const RUN_KEY = "pageConnectRun";
 /** Launched tab being watched for notifications: { tabId, targetUrl, notify, sent, until }. */
 const MONITOR_KEY = "pageConnectMonitor";
 const MONITOR_MS = 30 * 60_000;
-/** Don't repeat a "verify" alert for the same tab more often than this. */
-const VERIFY_REPEAT_MS = 5 * 60_000;
 
 /** Fires ~10s before T−60s so we can wake, then fine-wait to T−60s. */
 const ALARM_PRE_LATENCY = "pageConnectAlarmPreLatency";
+/** Retail drops: opens the store at T−5 min for sign-in and checks. */
+const ALARM_PREP = "pageConnectAlarmPrep";
+const RETAIL_PREP_MS = 5 * 60_000;
 /** Fires well before adjusted launch so a cold service-worker boot still has time to spin. */
 const ALARM_PRE_LAUNCH = "pageConnectAlarmPreLaunch";
 
@@ -117,7 +130,11 @@ function clearSession() {
 }
 
 async function clearOurAlarms() {
-  await Promise.all([chrome.alarms.clear(ALARM_PRE_LATENCY), chrome.alarms.clear(ALARM_PRE_LAUNCH)]);
+  await Promise.all([
+    chrome.alarms.clear(ALARM_PRE_LATENCY),
+    chrome.alarms.clear(ALARM_PRE_LAUNCH),
+    chrome.alarms.clear(ALARM_PREP),
+  ]);
 }
 
 /**
@@ -126,7 +143,7 @@ async function clearOurAlarms() {
 async function isOrchestrationActive() {
   if (session && !session.cancel) return true;
   const alarms = await chrome.alarms.getAll();
-  return alarms.some((a) => a.name === ALARM_PRE_LATENCY || a.name === ALARM_PRE_LAUNCH);
+  return alarms.some((a) => a.name === ALARM_PRE_LATENCY || a.name === ALARM_PRE_LAUNCH || a.name === ALARM_PREP);
 }
 
 /**
@@ -192,7 +209,7 @@ async function waitUntilEpoch(targetEpochMs, run) {
  * @param {string} url
  * @returns {Promise<number>}
  */
-async function pingOnce(url) {
+async function pingOnce(url, getOnly = false) {
   const measure = async (method) => {
     const t0 = performance.now();
     const res = await fetch(url, {
@@ -210,6 +227,7 @@ async function pingOnce(url) {
   };
 
   try {
+    if (getOnly) throw new Error("GET only");
     return await measure("HEAD");
   } catch (e1) {
     try {
@@ -228,9 +246,9 @@ async function pingOnce(url) {
  * @param {{ cancel: boolean }} run
  * @returns {Promise<number>}
  */
-async function runLatencySuite(targetUrl, run) {
+async function runLatencySuite(targetUrl, run, getOnly = false) {
   notifyStatus("Warming connection (primer ping, discarded)…");
-  await pingOnce(targetUrl);
+  await pingOnce(targetUrl, getOnly);
   if (run.cancel) return 0;
 
   const samples = [];
@@ -238,7 +256,7 @@ async function runLatencySuite(targetUrl, run) {
     if (run.cancel) return samples.length ? samples.reduce((a, b) => a + b, 0) / samples.length : 0;
 
     notifyStatus(`Pinging (${i + 1}/4)…`);
-    samples.push(await pingOnce(targetUrl));
+    samples.push(await pingOnce(targetUrl, getOnly));
 
     if (i < 3) {
       notifyStatus(`Waiting 10 seconds before next ping (${i + 1}/4 done)…`);
@@ -294,13 +312,14 @@ async function finalizeRunFailure(message) {
  * @param {string} targetUrl
  * @returns {Promise<{ tabId: number, windowId: number | null, windowState: string | null } | null>} ids or null
  */
-async function createWarmupTab(run, targetUrl) {
+async function createWarmupTab(run, targetUrl, homepage = false) {
   if (run.cancel) return null;
   try {
     const targetOrigin = new URL(targetUrl).origin;
     // Use a unique fake path so most servers return a lightweight 404 HTML page.
     // This lets us inject an in-tab heartbeat that warms the *tab's* network partition.
-    const warmupUrl = `${targetOrigin}/_page_connect_warmup_${Date.now()}`;
+    // Retail sites get their real homepage: WAFs tend to score made-up paths as probing.
+    const warmupUrl = homepage ? `${targetOrigin}/` : `${targetOrigin}/_page_connect_warmup_${Date.now()}`;
     // (`muted` is not a `tabs.create` option; passing it makes the call throw.)
     const tab = await chrome.tabs.create({ url: warmupUrl, active: false });
     if (tab.id == null) return null;
@@ -378,9 +397,25 @@ async function executeFromT60(run, state) {
   lockPowerAwake();
   const { targetUrl, targetEpochMs } = state;
   const targetOrigin = new URL(targetUrl).origin;
+  const shop = retailerFor(targetUrl);
+  // Retail: time a static asset with plain GETs (some stores block HEAD or score it as a bot).
+  const pingUrl = shop ? `${targetOrigin}${shop.pingPath}` : targetUrl;
 
-  notifyStatus("Opening warmup tab on target origin (warm 404)…");
-  const warm = await createWarmupTab(run, targetUrl);
+  /** @type {{ tabId: number, windowId: number | null, windowState: string | null } | null} */
+  let warm = null;
+  if (typeof state.prepTabId === "number") {
+    try {
+      const t = await chrome.tabs.get(state.prepTabId);
+      if (t.id != null) warm = { tabId: t.id, windowId: t.windowId ?? null, windowState: state.warmupWindowState ?? null };
+      notifyStatus(`Launch will use the ${shop?.name ?? "store"} tab you signed in on (not reloaded).`);
+    } catch {
+      /* closed: open a fresh one below */
+    }
+  }
+  if (!warm) {
+    notifyStatus(shop ? `Opening ${shop.name} in a warm tab…` : "Opening warmup tab on target origin (warm 404)…");
+    warm = await createWarmupTab(run, targetUrl, Boolean(shop));
+  }
   const warmupTabId = warm?.tabId ?? null;
   const warmupWindowId = warm?.windowId ?? null;
   const warmupWindowState = warm?.windowState ?? null;
@@ -391,7 +426,7 @@ async function executeFromT60(run, state) {
   if (run.cancel) return;
 
   notifyStatus("Starting latency checks at T−60s…");
-  const avgLatency = await runLatencySuite(targetUrl, run);
+  const avgLatency = await runLatencySuite(pingUrl, run, Boolean(shop));
   if (run.cancel) return;
 
   // `avgLatency` is measured as RTT (round-trip). To target server-arrival time, approximate one-way transit as RTT/2.
@@ -441,7 +476,7 @@ async function executeFromT60(run, state) {
       const cutoffMs = Math.max(0, msUntilLaunch - HEARTBEAT_CUTOFF_MS);
       await chrome.scripting.executeScript({
         target: { tabId: warmupTabId },
-        func: (origin, cutoffMs, intervalMs) => {
+        func: (url, method, cutoffMs, intervalMs) => {
           // Runs inside the warmup tab (main-frame partition).
           const stopAt = Date.now() + cutoffMs;
           // Clear any previous run if present.
@@ -454,10 +489,10 @@ async function executeFromT60(run, state) {
               globalThis.__pageConnectHeartbeatTimer = null;
               return;
             }
-            fetch(origin, { method: "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
+            fetch(url, { method, cache: "no-store", priority: "high" }).catch(() => {});
           }, intervalMs);
         },
-        args: [targetOrigin, cutoffMs, HEARTBEAT_MS],
+        args: [shop ? pingUrl : targetOrigin, shop ? "GET" : "HEAD", cutoffMs, HEARTBEAT_MS],
       });
       usingInjectedHeartbeat = true;
       notifyStatus("Socket heartbeat transferred to renderer process partition.");
@@ -475,7 +510,7 @@ async function executeFromT60(run, state) {
         await delay(Math.min(HEARTBEAT_MS, Math.max(0, heartbeatStopAt - t)), run);
         if (!keepSocketHot || run.cancel) break;
         if (Date.now() >= heartbeatStopAt) break;
-        fetch(targetOrigin, { method: "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
+        fetch(shop ? pingUrl : targetOrigin, { method: shop ? "GET" : "HEAD", cache: "no-store", priority: "high" }).catch(() => {});
       }
     })();
   }
@@ -536,9 +571,9 @@ async function waitT60AndContinue(run, job) {
  * @param {NotifyContact | null | undefined} notify
  */
 async function startMonitor(tabId, targetUrl, notify) {
-  if (!hasContact(notify)) return;
+  // Runs without a contact too: a check on the launched page still gets a desktop alert.
   await chrome.storage.local.set({
-    [MONITOR_KEY]: { tabId, targetUrl, notify, sent: {}, until: Date.now() + MONITOR_MS },
+    [MONITOR_KEY]: { tabId, targetUrl, notify: hasContact(notify) ? notify : null, sent: {}, until: Date.now() + MONITOR_MS },
   });
 }
 
@@ -590,6 +625,102 @@ async function classifyPage(targetUrl, signals) {
   return result;
 }
 
+/** @param {string} url */
+function siteName(url) {
+  return retailerFor(url)?.name ?? new URL(url).hostname.replace(/^www\./, "");
+}
+
+/** @type {Record<string, ReturnType<typeof setTimeout>>} */
+const recheckTimers = {};
+/** One pending re-check per purpose; a newer one replaces it. Lost if the worker sleeps (navigation wakes it). */
+function scheduleRecheck(key, tabId, fn) {
+  clearTimeout(recheckTimers[key]);
+  recheckTimers[key] = setTimeout(() => void fn(), ATTENTION_REPEAT_MS);
+}
+
+/**
+ * Retail drop: wait for T−5 min (or schedule an alarm for it), then open the store.
+ * @param {{ cancel: boolean }} run
+ * @param {import("./retailers.js").Retailer} shop
+ * @param {{ targetUrl: string, targetEpochMs: number, notify?: NotifyContact | null }} job
+ * @returns {Promise<boolean>} true if an alarm will continue the run (stop here)
+ */
+async function prepareRetail(run, shop, job) {
+  const prepAt = job.targetEpochMs - RETAIL_PREP_MS;
+  if (prepAt - Date.now() > LONG_WAIT_MS) {
+    await chrome.alarms.create(ALARM_PREP, { when: prepAt });
+    notifyStatus(
+      `${shop.name} drop: the store opens in a tab at T−5 min (${new Date(prepAt).toLocaleTimeString()}) so you can sign in and clear any check before launch. The service worker may sleep until then.`,
+    );
+    return true;
+  }
+  if (prepAt > Date.now()) {
+    notifyStatus(`${shop.name} drop: opening the store at T−5 min (${new Date(prepAt).toLocaleTimeString()})…`);
+    await waitUntilEpoch(prepAt, run);
+    if (run.cancel) return false;
+  }
+  await openPrepTab(shop, job);
+  return false;
+}
+
+/**
+ * Open the store's homepage for sign-in and checks; it becomes the launch tab.
+ * @param {import("./retailers.js").Retailer} shop
+ * @param {{ targetUrl: string, notify?: NotifyContact | null }} job
+ */
+async function openPrepTab(shop, job) {
+  lockPowerAwake();
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: `${new URL(job.targetUrl).origin}/`, active: true });
+  } catch (e) {
+    notifyStatus(`Couldn't open ${shop.name} early (${e instanceof Error ? e.message : e}); a warm tab opens at T−60s instead.`);
+    return;
+  }
+  if (tab.id == null) return;
+  chrome.tabs.update(tab.id, { autoDiscardable: false }).catch(() => {});
+  let windowState = null;
+  try {
+    windowState = (await chrome.windows.get(tab.windowId)).state ?? null;
+  } catch {
+    /* ignore */
+  }
+  await mergeRunState({ prepTabId: tab.id, warmupTabId: tab.id, warmupWindowId: tab.windowId ?? null, warmupWindowState: windowState });
+  notifyStatus(`Opened ${shop.name}. Sign in and complete any check in that tab now; it won't be reloaded before launch.`);
+  void demandAttention(tab.id, `${shop.name} drop in 5 minutes`, "Sign in and complete any check in this tab now, so nothing slows you down at launch.");
+  if (job.notify) void sendNotify(job.notify, "verify", job.targetUrl);
+}
+
+let prepAlertAt = 0;
+
+/**
+ * The prep tab loaded a page: if it's a human check or sign-in, bring it to the user (again each
+ * minute until it's done). Runs until launch, when the launched-tab monitor takes over.
+ * @param {number} tabId
+ */
+async function checkPrepTab(tabId) {
+  const st = await readRunState();
+  if (!st || st.prepTabId !== tabId || Date.now() >= st.targetEpochMs) return;
+  let kind = null;
+  try {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: classifyPage, args: [st.targetUrl, PAGE_SIGNALS] });
+    kind = res?.result ?? null;
+  } catch {
+    return;
+  }
+  if (kind !== "verify") {
+    if (prepAlertAt) void clearAttention(tabId);
+    prepAlertAt = 0;
+    return;
+  }
+  if (Date.now() - prepAlertAt > ATTENTION_REPEAT_MS) {
+    prepAlertAt = Date.now();
+    notifyStatus(`${siteName(st.targetUrl)} is asking you to sign in or complete a check in the launch tab — do it now, before the drop.`);
+    void demandAttention(tabId, `${siteName(st.targetUrl)} needs you before the drop`, "Complete the sign-in or check in this tab now.");
+  }
+  scheduleRecheck("prep", tabId, () => checkPrepTab(tabId));
+}
+
 let monitorBusy = false;
 let monitorAgain = false;
 
@@ -616,7 +747,7 @@ async function checkMonitoredTab(tabId) {
       const sent = { ...mon.sent };
       if (!sent.connected) {
         sent.connected = Date.now();
-        void sendNotify(mon.notify, "connected", mon.targetUrl);
+        if (mon.notify) void sendNotify(mon.notify, "connected", mon.targetUrl);
       }
 
       let kind = null;
@@ -627,12 +758,29 @@ async function checkMonitoredTab(tabId) {
         console.warn("classifyPage failed:", e);
       }
 
-      if (kind === "verify" && (!sent.verify || Date.now() - sent.verify > VERIFY_REPEAT_MS)) {
-        sent.verify = Date.now();
-        void sendNotify(mon.notify, "verify", mon.targetUrl);
+      // A stock watch on this tab (add to cart after launch) does its own check alerts.
+      const watched = (await getWatch())?.tabId === tabId;
+      if (kind === "verify" && !watched) {
+        const now = Date.now();
+        if (!sent.attention || now - sent.attention > ATTENTION_REPEAT_MS) {
+          sent.attention = now;
+          void demandAttention(tabId, `${siteName(mon.targetUrl)} needs you`, "Sign in or complete the check in this tab.");
+        }
+        const count = sent.verifyCount ?? 0;
+        if (mon.notify && count < REMOTE_VERIFY_MAX && (!sent.verify || now - sent.verify > REMOTE_VERIFY_MS)) {
+          sent.verify = now;
+          sent.verifyCount = count + 1;
+          void sendNotify(mon.notify, "verify", mon.targetUrl);
+        }
+        // Look again in a minute (without reloading) to repeat the alert while it's outstanding.
+        scheduleRecheck("monitor", tabId, () => checkMonitoredTab(tabId));
+      } else if (sent.attention) {
+        sent.attention = 0;
+        sent.verifyCount = 0;
+        void clearAttention(tabId);
       }
       if (kind === "arrived" && !sent.arrived) {
-        void sendNotify(mon.notify, "arrived", mon.targetUrl);
+        if (mon.notify) void sendNotify(mon.notify, "arrived", mon.targetUrl);
         await chrome.storage.local.remove(MONITOR_KEY);
         return;
       }
@@ -648,16 +796,19 @@ chrome.tabs.onUpdated.addListener((tabId, info) => {
   if (info.status !== "complete" && !info.url) return;
   void checkMonitoredTab(tabId);
   void runCheck(tabId);
+  void checkPrepTab(tabId);
 });
 
-chrome.notifications?.onClicked.addListener((id) => void handleNotificationClick(id));
+chrome.notifications?.onClicked.addListener((id) => {
+  if (!handleAttentionClick(id)) void handleNotificationClick(id);
+});
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === WATCH_ALARM) {
     void handleWatchAlarm();
     return;
   }
-  if (alarm.name !== ALARM_PRE_LATENCY && alarm.name !== ALARM_PRE_LAUNCH) return;
+  if (alarm.name !== ALARM_PRE_LATENCY && alarm.name !== ALARM_PRE_LAUNCH && alarm.name !== ALARM_PREP) return;
 
   void (async () => {
     const run = { cancel: false };
@@ -671,8 +822,18 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         return;
       }
 
-        if (alarm.name === ALARM_PRE_LATENCY) {
-        await chrome.alarms.clear(ALARM_PRE_LATENCY);
+      if (alarm.name === ALARM_PREP || alarm.name === ALARM_PRE_LATENCY) {
+        await chrome.alarms.clear(alarm.name);
+        if (alarm.name === ALARM_PREP) {
+          const shop = retailerFor(st.targetUrl);
+          if (shop) await openPrepTab(shop, st);
+          // Back to the usual plan: wake at T−3 min for the latency window.
+          const when = st.targetEpochMs - T180_MS_BEFORE_TARGET;
+          if (when - Date.now() > 10_000) {
+            await chrome.alarms.create(ALARM_PRE_LATENCY, { when });
+            return;
+          }
+        }
         await waitT60AndContinue(run, st);
         if (run.cancel) {
           const rs = await readRunState();
@@ -842,7 +1003,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           return;
         }
 
-        const msUntilT60 = oneMinuteBefore - now;
+        // Retail drop: open the store at T−5 min for sign-in and checks first.
+        const shop = retailerFor(targetUrl);
+        if (shop && (await prepareRetail(run, shop, { targetUrl, targetEpochMs, notify }))) {
+          session = null;
+          return;
+        }
+        if (run.cancel) return;
+
+        const msUntilT60 = oneMinuteBefore - Date.now();
 
         if (msUntilT60 > LONG_WAIT_MS) {
           const when = targetEpochMs - T180_MS_BEFORE_TARGET;

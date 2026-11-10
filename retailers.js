@@ -1,6 +1,7 @@
 /**
  * Retail sites the stock watch can add to cart on.
  *
+ * `pingPath` is a same-origin static file used to time latency before a scheduled drop.
  * `add`, `soldOut` and `cartCount` are CSS selectors for the main buy box. They are hints, tried
  * first; if a site changes its markup the watch falls back to finding the button by its text
  * ("Add to cart", "Ship it", "Pre-order"), so a stale selector degrades instead of breaking.
@@ -12,6 +13,7 @@
  *   name: string,
  *   domains: string[],
  *   cartUrl: string,
+ *   pingPath: string,
  *   add: string[],
  *   soldOut: string[],
  *   cartCount: string[],
@@ -25,6 +27,7 @@ export const RETAILERS = [
     name: "Pokémon Center",
     domains: ["pokemoncenter.com"],
     cartUrl: "https://www.pokemoncenter.com/cart",
+    pingPath: "/favicon.ico",
     add: ['button[class*="add-to-cart-button"]'],
     soldOut: [],
     cartCount: ['a[href$="/cart"]'],
@@ -34,6 +37,7 @@ export const RETAILERS = [
     name: "Target",
     domains: ["target.com"],
     cartUrl: "https://www.target.com/cart",
+    pingPath: "/favicon.ico",
     add: [
       'button[data-test="shippingButton"]',
       'button[data-test="shipItButton"]',
@@ -48,6 +52,7 @@ export const RETAILERS = [
     name: "Walmart",
     domains: ["walmart.com"],
     cartUrl: "https://www.walmart.com/cart",
+    pingPath: "/favicon.ico",
     add: ['[data-testid="add-to-cart-section"] button', 'button[data-dca-name="ItemBuyBoxAddToCartButton"]'],
     soldOut: [],
     cartCount: ['[data-automation-id="cart-item-count"]', "#cart-badge"],
@@ -57,6 +62,7 @@ export const RETAILERS = [
     name: "Sam's Club",
     domains: ["samsclub.com"],
     cartUrl: "https://www.samsclub.com/cart",
+    pingPath: "/favicon.ico",
     add: ['[data-testid="add-to-cart-section"] button'],
     soldOut: [],
     cartCount: ['[data-automation-id="cart-item-count"]'],
@@ -66,6 +72,7 @@ export const RETAILERS = [
     name: "Best Buy",
     domains: ["bestbuy.com"],
     cartUrl: "https://www.bestbuy.com/cart",
+    pingPath: "/favicon.ico",
     add: [
       'button[data-button-state="ADD_TO_CART"]',
       'button[data-button-state="PRE_ORDER"]',
@@ -79,6 +86,7 @@ export const RETAILERS = [
     name: "Costco",
     domains: ["costco.com"],
     cartUrl: "https://www.costco.com/CheckoutCartDisplayView",
+    pingPath: "/favicon.ico",
     add: ["#add-to-cart-btn"],
     soldOut: ["#oos-overlay"],
     cartCount: ["#cart-d .cart-number"],
@@ -88,6 +96,7 @@ export const RETAILERS = [
     name: "GameStop",
     domains: ["gamestop.com"],
     cartUrl: "https://www.gamestop.com/cart/",
+    pingPath: "/favicon.ico",
     add: ["button.add-to-cart"],
     soldOut: [],
     cartCount: [".minicart-quantity"],
@@ -97,6 +106,7 @@ export const RETAILERS = [
     name: "Amazon",
     domains: ["amazon.com"],
     cartUrl: "https://www.amazon.com/gp/cart/view.html",
+    pingPath: "/favicon.ico",
     add: ["#add-to-cart-button"],
     soldOut: ["#outOfStock"],
     cartCount: ["#nav-cart-count"],
