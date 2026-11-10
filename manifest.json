@@ -1,10 +1,21 @@
 {
   "manifest_version": 3,
   "name": "Page Connect",
-  "version": "1.2.0",
-  "description": "Opens a URL at a precise time, adjusted for measured network latency.",
-  "permissions": ["storage", "tabs", "alarms", "windows", "power", "scripting"],
-  "host_permissions": ["<all_urls>"],
+  "version": "1.4.0",
+  "description": "Opens a URL at a precise time, and watches retail product pages to add an item to your cart when it's available.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "alarms",
+    "windows",
+    "power",
+    "scripting",
+    "notifications",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js",
     "type": "module"
@@ -12,5 +23,9 @@
   "action": {
     "default_title": "Page Connect",
     "default_popup": "popup.html"
-  }
+  },
+  "icons": {
+    "128": "icon.png"
+  },
+  "minimum_chrome_version": "116"
 }

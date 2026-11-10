@@ -10,8 +10,13 @@
     <div class="wrap">
       <header>
         <h1>Page Connect</h1>
-        <p>Open any page at an exact time, adjusted for measured network latency.</p>
+        <p>Open any page at an exact time, or watch a store's product page and add the item to your cart when it's available.</p>
       </header>
+
+      <div class="modes" role="radiogroup" aria-label="Mode">
+        <label><input type="radio" name="mode" id="modeTime" value="time" checked /> Open at a set time</label>
+        <label><input type="radio" name="mode" id="modeWatch" value="watch" /> Watch for stock</label>
+      </div>
 
       <div class="field">
         <label for="targetUrl">Target URL</label>
@@ -24,7 +29,7 @@
         />
       </div>
 
-      <div class="row">
+      <div class="row" id="timeRow">
         <div class="field" style="margin-bottom: 0">
           <label for="targetDateTime">Target date &amp; time</label>
           <input id="targetDateTime" type="datetime-local" step="1" />
@@ -40,8 +45,27 @@
           </select>
         </div>
       </div>
-      <p class="hint">
+      <p class="hint" id="timeHint">
         The datetime is interpreted as wall-clock time in the selected timezone (default Pacific).
+      </p>
+
+      <div class="field" id="intervalRow" hidden>
+        <label for="watchInterval">Check the page every</label>
+        <select id="watchInterval">
+          <option value="30">30 seconds</option>
+          <option value="60" selected>1 minute</option>
+          <option value="120">2 minutes</option>
+          <option value="300">5 minutes</option>
+        </select>
+      </div>
+
+      <label class="consent" for="autoCart" style="margin-top: 12px">
+        <input id="autoCart" type="checkbox" />
+        <span id="autoCartLabel">Add it to my cart when it's available, then alert me with a link to my cart.</span>
+      </label>
+      <p class="hint" id="autoCartHint" style="margin-top: 0">
+        Works on Pokémon Center, Target, Walmart, Sam's Club, Best Buy, Costco, GameStop and Amazon. Sign in to the store
+        first. You check out and pay yourself, and you complete any sign-in or human check the store shows.
       </p>
 
       <div class="field" style="margin-top: 12px">
@@ -57,8 +81,8 @@
         <span>I agree to receive automated Page Connect texts about this launch at this number. Msg &amp; data rates may apply. Reply STOP to opt out.</span>
       </label>
       <p class="hint">
-        Alerts when the page opens, when the site asks you to sign in or complete a human check, and when you reach the
-        product page. Sent through bretttomita.com.
+        Alerts when the page opens, when the site asks you to sign in or complete a human check, when you reach the
+        product page, and when your cart is ready. Sent through bretttomita.com.
       </p>
 
       <div class="actions">
@@ -74,6 +98,7 @@
           <strong>Idle.</strong>
           Configure URL and time, then press Start.
         </div>
+        <a id="resultLink" class="result-link" target="_blank" rel="noopener" hidden></a>
       </div>
     </div>
 
