@@ -15,7 +15,7 @@
  */
 
 import { retailerFor } from "./retailers.js";
-import { PAGE_SIGNALS, hasContact, sendNotify } from "./shared.js";
+import { PAGE_SIGNALS, hasContact, sendNotify, attemptSolveChallenge, performTrustedClick } from "./shared.js";
 import { ATTENTION_REPEAT_MS, REMOTE_VERIFY_MAX, REMOTE_VERIFY_MS, clearAttention, demandAttention } from "./attention.js";
 
 export const MSG_WATCH = "PAGE_CONNECT_WATCH";
@@ -290,6 +290,24 @@ export async function watchPage(cfg) {
     return null;
   };
 
+  if (cfg.beforeSnapshot) {
+    const before = cfg.beforeSnapshot;
+    const flag = (globalThis.__pageConnectCart = { waitSeen: false });
+    for (let i = 0; i < 30; i++) {
+      await sleep(500);
+      if (/\/(cart|checkout|basket)\b/i.test(location.pathname)) return { state: "carted", title: title(), clicked: true };
+      const count = cartCount();
+      if (count != null && before.count != null && count > before.count) return { state: "carted", title: title(), clicked: true };
+      if (!before.confirmed && CONFIRM_TEXT.test(bodyText())) return { state: "carted", title: title(), clicked: true };
+      const b = blocker();
+      if (b) return { state: b, title: title(), clicked: true };
+      const err = before.error ? null : errorSeen();
+      if (err) return { state: "failed", detail: err, title: title(), clicked: true };
+      if (waiting()) flag.waitSeen = true;
+    }
+    return { state: flag.waitSeen && waiting() ? "queue" : "clicked", title: title(), clicked: true };
+  }
+
   // 1) What is the page showing? Poll: buy boxes, checks and waiting rooms render after load.
   const pressed = globalThis.__pageConnectCart;
   let button = null;
@@ -310,23 +328,7 @@ export async function watchPage(cfg) {
 
   // 2) Press it once and wait for the page to confirm.
   const before = { count: cartCount(), confirmed: CONFIRM_TEXT.test(bodyText()), error: errorSeen() };
-  const flag = (globalThis.__pageConnectCart = { waitSeen: false });
-  button.scrollIntoView({ block: "center" });
-  button.click();
-
-  for (let i = 0; i < 30; i++) {
-    await sleep(500);
-    if (/\/(cart|checkout|basket)\b/i.test(location.pathname)) return { state: "carted", title: title(), clicked: true };
-    const count = cartCount();
-    if (count != null && before.count != null && count > before.count) return { state: "carted", title: title(), clicked: true };
-    if (!before.confirmed && CONFIRM_TEXT.test(bodyText())) return { state: "carted", title: title(), clicked: true };
-    const b = blocker();
-    if (b) return { state: b, title: title(), clicked: true };
-    const err = before.error ? null : errorSeen();
-    if (err) return { state: "failed", detail: err, title: title(), clicked: true };
-    if (waiting()) flag.waitSeen = true;
-  }
-  return { state: flag.waitSeen && waiting() ? "queue" : "clicked", title: title(), clicked: true };
+  return { state: "ready_to_click", title: title(), before };
 }
 
 let busy = false;
@@ -410,6 +412,36 @@ export async function runCheck(tabId) {
 
       // Quick re-reads of a paused page aren't counted as checks.
       const next = { ...w, checks: w.checks + (w.hold ? 0 : 1), clicks: w.clicks + (res.clicked ? 1 : 0), lastState: res.state };
+
+      // NEW: Dispatch trusted CDP click when button is found
+      if (res.state === "ready_to_click") {
+        const clicked = await performTrustedClick(tabId, retailer.add);
+        if (clicked) {
+          try {
+            const [confirmOut] = await chrome.scripting.executeScript({
+              target: { tabId },
+              func: watchPage,
+              args: [
+                {
+                  url: w.url,
+                  autoCart,
+                  add: retailer.add,
+                  soldOut: retailer.soldOut,
+                  cartCount: retailer.cartCount,
+                  signals: PAGE_SIGNALS,
+                  beforeSnapshot: res.before,
+                },
+              ],
+            });
+            res = confirmOut?.result ?? { state: "clicked", title: res.title, clicked: true };
+          } catch {
+            res = { state: "clicked", title: res.title, clicked: true };
+          }
+        } else {
+          res = { state: "instock", title: res.title };
+        }
+      }
+
       if (res.state === "carted") {
         await finish("carted", next, res.title);
         return;
@@ -421,6 +453,19 @@ export async function runCheck(tabId) {
 
       next.hold = res.state === "verify" || res.state === "queue";
       if (res.state === "verify") {
+        // NEW: Try solver proxy first
+        const solved = await attemptSolveChallenge(tabId, w.url);
+        if (solved) {
+          // Solved: clear hold and re-check page immediately
+          next.hold = false;
+          next.attentionAt = 0;
+          next.verifyAt = 0;
+          next.verifySent = 0;
+          await chrome.storage.local.set({ [WATCH_KEY]: next });
+          scheduleHoldCheck(tabId);
+          return;
+        }
+
         const now = Date.now();
         if (now - (w.attentionAt ?? 0) > ATTENTION_REPEAT_MS) {
           next.attentionAt = now;
@@ -487,7 +532,25 @@ export async function handleWatchAlarm() {
   } else if (w.lastState === "offpage" || w.lastState === "error") {
     await chrome.tabs.update(w.tabId, { url: w.url }).catch(() => {});
   } else {
+    // 1. Generate minor interaction entropy before reload so the session telemetry is non-zero
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: w.tabId },
+        func: () => window.scrollBy({ top: 80, behavior: "smooth" }),
+      });
+      await new Promise((r) => setTimeout(r, 350 + Math.random() * 250));
+    } catch {}
+
+    // 2. Perform reload
     await chrome.tabs.reload(w.tabId).catch(() => {});
+
+    // 3. Jitter the next alarm tick (adds 2s–7s log-normal variance)
+    const jitterSec = Math.floor(-Math.log(1 - Math.random()) * 3) + 2;
+    const nextIntervalMin = (w.intervalSec + jitterSec) / 60;
+    await chrome.alarms.create(WATCH_ALARM, {
+      delayInMinutes: nextIntervalMin,
+      periodInMinutes: w.intervalSec / 60,
+    });
   }
 }
 

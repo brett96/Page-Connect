@@ -26,7 +26,7 @@
  */
 
 import { retailerFor } from "./retailers.js";
-import { PAGE_SIGNALS, hasContact, sendNotify } from "./shared.js";
+import { PAGE_SIGNALS, hasContact, sendNotify, attemptSolveChallenge, performTrustedClick } from "./shared.js";
 import {
   ATTENTION_REPEAT_MS,
   REMOTE_VERIFY_MAX,
@@ -52,6 +52,7 @@ const MSG = {
   STATUS: "PAGE_CONNECT_STATUS",
   DONE: "PAGE_CONNECT_DONE",
   PING: "PAGE_CONNECT_PING",
+  TRUSTED_CLICK: "PAGE_CONNECT_TRUSTED_CLICK",
 };
 
 const ACTIVE_KEY = "pageConnectActive";
@@ -259,8 +260,9 @@ async function runLatencySuite(targetUrl, run, getOnly = false) {
     samples.push(await pingOnce(targetUrl, getOnly));
 
     if (i < 3) {
-      notifyStatus(`Waiting 10 seconds before next ping (${i + 1}/4 done)…`);
-      await delay(10_000, run);
+      const jitteredMs = Math.round(10_000 * (0.8 + Math.random() * 0.4)); // 8s–12s jitter
+      notifyStatus(`Waiting ${(jitteredMs / 1000).toFixed(1)}s before next ping (${i + 1}/4 done)…`);
+      await delay(jitteredMs, run);
     }
   }
   return samples.reduce((a, b) => a + b, 0) / samples.length;
@@ -319,7 +321,9 @@ async function createWarmupTab(run, targetUrl, homepage = false) {
     // Use a unique fake path so most servers return a lightweight 404 HTML page.
     // This lets us inject an in-tab heartbeat that warms the *tab's* network partition.
     // Retail sites get their real homepage: WAFs tend to score made-up paths as probing.
-    const warmupUrl = homepage ? `${targetOrigin}/` : `${targetOrigin}/_page_connect_warmup_${Date.now()}`;
+    const warmupUrl = homepage
+      ? `${targetOrigin}/`
+      : `${targetOrigin}/robots.txt?_=${Math.random().toString(36).slice(2, 8)}`;
     // (`muted` is not a `tabs.create` option; passing it makes the call throw.)
     const tab = await chrome.tabs.create({ url: warmupUrl, active: false });
     if (tab.id == null) return null;
@@ -477,22 +481,22 @@ async function executeFromT60(run, state) {
       await chrome.scripting.executeScript({
         target: { tabId: warmupTabId },
         func: (url, method, cutoffMs, intervalMs) => {
-          // Runs inside the warmup tab (main-frame partition).
           const stopAt = Date.now() + cutoffMs;
-          // Clear any previous run if present.
           try {
-            if (globalThis.__pageConnectHeartbeatTimer) clearInterval(globalThis.__pageConnectHeartbeatTimer);
+            if (globalThis.__pageConnectHeartbeatTimer) clearTimeout(globalThis.__pageConnectHeartbeatTimer);
           } catch {}
-          globalThis.__pageConnectHeartbeatTimer = setInterval(() => {
+          const tick = () => {
             if (Date.now() > stopAt) {
-              clearInterval(globalThis.__pageConnectHeartbeatTimer);
               globalThis.__pageConnectHeartbeatTimer = null;
               return;
             }
             fetch(url, { method, cache: "no-store", priority: "high" }).catch(() => {});
-          }, intervalMs);
+            const nextMs = Math.round(intervalMs * (0.75 + Math.random() * 0.5));
+            globalThis.__pageConnectHeartbeatTimer = setTimeout(tick, nextMs);
+          };
+          globalThis.__pageConnectHeartbeatTimer = setTimeout(tick, intervalMs);
         },
-        args: [shop ? pingUrl : targetOrigin, shop ? "GET" : "HEAD", cutoffMs, HEARTBEAT_MS],
+        args: [shop ? pingUrl : `${targetOrigin}/favicon.ico`, shop ? "GET" : "HEAD", cutoffMs, HEARTBEAT_MS],
       });
       usingInjectedHeartbeat = true;
       notifyStatus("Socket heartbeat transferred to renderer process partition.");
@@ -514,6 +518,9 @@ async function executeFromT60(run, state) {
       }
     })();
   }
+
+  const jitteredHb = Math.round(HEARTBEAT_MS * (0.75 + Math.random() * 0.5));
+  await delay(Math.min(jitteredHb, Math.max(0, heartbeatStopAt - t)), run);
 
   if (msUntilLaunch > LONG_WAIT_MS) {
     keepSocketHot = false;
@@ -625,6 +632,98 @@ async function classifyPage(targetUrl, signals) {
   return result;
 }
 
+/**
+ * Extracts a Turnstile/reCAPTCHA/hCaptcha sitekey from the tab, relays it to the
+ * Page Connect solver proxy, and injects the token into the page.
+ * @param {number} tabId
+ * @param {string} fallbackUrl
+ * @returns {Promise<boolean>} true if a challenge token was solved and injected
+ */
+export async function attemptSolveChallenge(tabId, fallbackUrl) {
+  try {
+    // 1. Extract sitekey and challenge type from the tab
+    const [probe] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        // Never auto-solve if it's a password/login prompt
+        const visible = (el) => !!el && el.getClientRects().length > 0;
+        if ([...document.querySelectorAll('input[type="password"]')].some(visible)) return null;
+
+        const el = document.querySelector("[data-sitekey]");
+        if (!el) return null;
+        const sitekey = el.getAttribute("data-sitekey");
+        if (!sitekey) return null;
+
+        const isTurnstile =
+          el.classList.contains("cf-turnstile") ||
+          !!document.querySelector('input[name="cf-turnstile-response"]');
+        const isHCaptcha =
+          el.classList.contains("h-captcha") ||
+          !!document.querySelector('textarea[name="h-captcha-response"]');
+
+        return {
+          sitekey,
+          pageUrl: location.href,
+          taskType: isTurnstile
+            ? "AntiTurnstileTaskProxyLess"
+            : isHCaptcha
+              ? "HCaptchaTaskProxyLess"
+              : "ReCaptchaV2TaskProxyLess",
+        };
+      },
+    });
+
+    const info = probe?.result;
+    if (!info) return false;
+
+    notifyStatus(`Attempting automated check solve (${info.taskType})…`);
+    const res = await fetch("https://bretttomita.com/api/page-connect/solve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        taskType: info.taskType,
+        websiteURL: info.pageUrl || fallbackUrl,
+        websiteKey: info.sitekey,
+      }),
+    });
+    if (!res.ok) return false;
+
+    const { solution } = await res.json();
+    const token = solution?.token || solution?.gRecaptchaResponse;
+    if (!token) return false;
+
+    // 2. Inject token in MAIN world so page callbacks can read it
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: (solvedToken) => {
+        const selectors = [
+          'input[name="cf-turnstile-response"]',
+          'textarea[name="g-recaptcha-response"]',
+          'textarea[name="h-captcha-response"]',
+        ];
+        for (const sel of selectors) {
+          const input = document.querySelector(sel);
+          if (input) {
+            input.value = solvedToken;
+            input.dispatchEvent(new Event("input", { bubbles: true }));
+            input.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+        const form = document.querySelector("form");
+        if (form && typeof form.submit === "function") form.submit();
+      },
+      args: [token],
+    });
+
+    notifyStatus("Check solved automatically.");
+    return true;
+  } catch (e) {
+    console.warn("attemptSolveChallenge failed:", e);
+    return false;
+  }
+}
+
 /** @param {string} url */
 function siteName(url) {
   return retailerFor(url)?.name ?? new URL(url).hostname.replace(/^www\./, "");
@@ -713,6 +812,17 @@ async function checkPrepTab(tabId) {
     prepAlertAt = 0;
     return;
   }
+  // NEW: Try solver service first; if it succeeds, skip manual chime
+  if (await attemptSolveChallenge(tabId, st.targetUrl)) {
+    scheduleRecheck("prep", tabId, () => checkPrepTab(tabId));
+    return;
+  }
+  if (Date.now() - prepAlertAt > ATTENTION_REPEAT_MS) {
+    prepAlertAt = Date.now();
+    notifyStatus(`${siteName(st.targetUrl)} is asking you to sign in or complete a check in the launch tab — do it now, before the drop.`);
+    void demandAttention(tabId, `${siteName(st.targetUrl)} needs you before the drop`, "Complete the sign-in or check in this tab now.");
+  }
+  scheduleRecheck("prep", tabId, () => checkPrepTab(tabId));
   if (Date.now() - prepAlertAt > ATTENTION_REPEAT_MS) {
     prepAlertAt = Date.now();
     notifyStatus(`${siteName(st.targetUrl)} is asking you to sign in or complete a check in the launch tab — do it now, before the drop.`);
@@ -761,18 +871,21 @@ async function checkMonitoredTab(tabId) {
       // A stock watch on this tab (add to cart after launch) does its own check alerts.
       const watched = (await getWatch())?.tabId === tabId;
       if (kind === "verify" && !watched) {
-        const now = Date.now();
-        if (!sent.attention || now - sent.attention > ATTENTION_REPEAT_MS) {
-          sent.attention = now;
-          void demandAttention(tabId, `${siteName(mon.targetUrl)} needs you`, "Sign in or complete the check in this tab.");
+        // NEW: Attempt automated solve before firing attention chime + SMS/email verify quota
+        const solved = await attemptSolveChallenge(tabId, mon.targetUrl);
+        if (!solved) {
+          const now = Date.now();
+          if (!sent.attention || now - sent.attention > ATTENTION_REPEAT_MS) {
+            sent.attention = now;
+            void demandAttention(tabId, `${siteName(mon.targetUrl)} needs you`, "Sign in or complete the check in this tab.");
+          }
+          const count = sent.verifyCount ?? 0;
+          if (mon.notify && count < REMOTE_VERIFY_MAX && (!sent.verify || now - sent.verify > REMOTE_VERIFY_MS)) {
+            sent.verify = now;
+            sent.verifyCount = count + 1;
+            void sendNotify(mon.notify, "verify", mon.targetUrl);
+          }
         }
-        const count = sent.verifyCount ?? 0;
-        if (mon.notify && count < REMOTE_VERIFY_MAX && (!sent.verify || now - sent.verify > REMOTE_VERIFY_MS)) {
-          sent.verify = now;
-          sent.verifyCount = count + 1;
-          void sendNotify(mon.notify, "verify", mon.targetUrl);
-        }
-        // Look again in a minute (without reloading) to repeat the alert while it's outstanding.
         scheduleRecheck("monitor", tabId, () => checkMonitoredTab(tabId));
       } else if (sent.attention) {
         sent.attention = 0;
@@ -895,11 +1008,115 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   })();
 });
 
+function cubicBezier(t, p0, p1, p2, p3) {
+  const u = 1 - t;
+  return u * u * u * p0 + 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t * p3;
+}
+
+/**
+ * Scrolls the target buy button into view, computes a randomized point inside its
+ * bounding box, and dispatches a Bézier mouse trajectory + hardware-trusted click via CDP.
+ * @param {number} tabId
+ * @param {string[]} [customSelectors]
+ * @returns {Promise<boolean>}
+ */
+export async function performTrustedClick(tabId, customSelectors = []) {
+  // 1. Scroll button into view and get viewport coordinates
+  const [coordsRes] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: async (selectors) => {
+      const BUY_TEXT = /^\s*(add to (cart|bag)|buy now|pre-?order( now)?|ship it)\s*$/i;
+      const visible = (el) => !!el && el.getClientRects().length > 0 && !el.disabled;
+      let btn = selectors.map((s) => document.querySelector(s)).find(visible);
+      if (!btn) {
+        btn = [...document.querySelectorAll('button, input[type="submit"], [role="button"]')].find(
+          (b) => visible(b) && BUY_TEXT.test(b.textContent || b.value || ""),
+        );
+      }
+      if (!btn) return null;
+
+      btn.scrollIntoView({ behavior: "smooth", block: "center" });
+      await new Promise((r) => setTimeout(r, 300 + Math.random() * 150));
+
+      const rect = btn.getBoundingClientRect();
+      return {
+        start: {
+          x: Math.round(window.innerWidth * (0.3 + Math.random() * 0.4)),
+          y: Math.round(window.innerHeight * (0.2 + Math.random() * 0.3)),
+        },
+        target: {
+          x: Math.round(rect.left + rect.width * (0.2 + Math.random() * 0.6)),
+          y: Math.round(rect.top + rect.height * (0.2 + Math.random() * 0.6)),
+        },
+      };
+    },
+    args: [customSelectors],
+  });
+
+  const coords = coordsRes?.result;
+  if (!coords) return false;
+
+  // 2. Attach CDP debugger, dispatch mouse trajectory + press/release, and immediately detach
+  const debuggee = { tabId };
+  await chrome.debugger.attach(debuggee, "1.3");
+  try {
+    const { start, target } = coords;
+    const steps = 18 + Math.floor(Math.random() * 10);
+    const cp1 = {
+      x: start.x + (target.x - start.x) * 0.3 + (Math.random() * 50 - 25),
+      y: start.y + (Math.random() * 50 - 25),
+    };
+    const cp2 = {
+      x: start.x + (target.x - start.x) * 0.7 + (Math.random() * 30 - 15),
+      y: target.y + (Math.random() * 30 - 15),
+    };
+
+    for (let i = 1; i <= steps; i++) {
+      const t = 1 - Math.pow(1 - i / steps, 2); // Ease-out deceleration
+      const x = Math.round(cubicBezier(t, start.x, cp1.x, cp2.x, target.x));
+      const y = Math.round(cubicBezier(t, start.y, cp1.y, cp2.y, target.y));
+      await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+        type: "mouseMoved",
+        x,
+        y,
+        pointerType: "mouse",
+      });
+      await new Promise((r) => setTimeout(r, 7 + Math.random() * 9));
+    }
+
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: target.x,
+      y: target.y,
+      button: "left",
+      buttons: 1,
+      clickCount: 1,
+    });
+    await new Promise((r) => setTimeout(r, 55 + Math.random() * 50));
+    await chrome.debugger.sendCommand(debuggee, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: target.x,
+      y: target.y,
+      button: "left",
+      buttons: 0,
+      clickCount: 1,
+    });
+    return true;
+  } finally {
+    await chrome.debugger.detach(debuggee).catch(() => {});
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (!msg || typeof msg !== "object") return;
 
   if (msg.type === MSG.PING) {
     void handlePing().then((r) => sendResponse(r));
+    return true;
+  }
+
+  if (msg.type === MSG.TRUSTED_CLICK && typeof msg.tabId === "number") {
+    void performTrustedClick(msg.tabId, msg.selectors).then((ok) => sendResponse({ ok }));
     return true;
   }
 
@@ -918,7 +1135,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
               target: { tabId: st.warmupTabId },
               func: () => {
                 try {
-                  if (globalThis.__pageConnectHeartbeatTimer) clearInterval(globalThis.__pageConnectHeartbeatTimer);
+                  if (globalThis.__pageConnectHeartbeatTimer) clearTimeout(globalThis.__pageConnectHeartbeatTimer);
                   globalThis.__pageConnectHeartbeatTimer = null;
                 } catch {}
               },
